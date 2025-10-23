@@ -1,4 +1,4 @@
-import os, json, sys, time, logging, random
+import os, json, sys, time, logging, random, re
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Optional
 
@@ -9,14 +9,15 @@ from google.oauth2.service_account import Credentials
 # =========================
 # Config
 # =========================
-SHEET_NAME    = os.getenv("SHEET_NAME", "Trading Log")
-WORKSHEET     = os.getenv("WORKSHEET", "log")           # original demo write
-SCRAPER_WS    = os.getenv("SCRAPER_WS", "scraper")      # scraping tab
-HTTP_TIMEOUT  = 15
+SHEET_NAME     = os.getenv("SHEET_NAME", "Trading Log")
+WORKSHEET      = os.getenv("WORKSHEET", "log")           # original demo write
+SCRAPER_WS     = os.getenv("SCRAPER_WS", "scraper")      # scraping tab
+HTTP_TIMEOUT   = int(os.getenv("HTTP_TIMEOUT", "15"))
 
-# Defaults chosen to reduce log noise / flakiness:
-NASDAQ_ENABLED     = os.getenv("NASDAQ_ENABLED", "0") not in {"0", "false", "False"}
-STOCKTWITS_ENABLED = os.getenv("STOCKTWITS_ENABLED", "1") not in {"0", "false", "False"}
+# Source toggles
+NASDAQ_ENABLED            = os.getenv("NASDAQ_ENABLED", "0") not in {"0", "false", "False"}
+STOCKTWITS_ENABLED       = os.getenv("STOCKTWITS_ENABLED", "1") not in {"0", "false", "False"}
+STOCKTWITS_SENTIMENT_EN  = os.getenv("STOCKTWITS_SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -80,15 +81,32 @@ def fetch_json_with_retries(
     retries: int = 3,
     backoff_base: float = 0.6,
 ) -> Dict:
-    """
-    Basic jittered exponential backoff.
-    """
     last_exc = None
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.json()
+        except Exception as e:
+            last_exc = e
+            time.sleep(backoff_base * (2 ** attempt) * (0.8 + 0.4 * random.random()))
+    raise last_exc
+
+def fetch_text_with_retries(
+    url: str,
+    *,
+    params: Optional[Dict] = None,
+    headers: Optional[Dict] = None,
+    timeout: int = HTTP_TIMEOUT,
+    retries: int = 3,
+    backoff_base: float = 0.6,
+) -> str:
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.text
         except Exception as e:
             last_exc = e
             time.sleep(backoff_base * (2 ** attempt) * (0.8 + 0.4 * random.random()))
@@ -175,11 +193,9 @@ def get_coingecko_top_by_volume(limit: int = 50) -> List[str]:
 # =========================
 # Fetchers: Social (Stocktwits)
 # =========================
-def get_stocktwits_trending() -> List[str]:
+def get_stocktwits_trending_api() -> List[str]:
     """
-    Stocktwits public trending symbols.
-    Docs historically at /api/2; this endpoint commonly returns:
-      {"symbols": [{"symbol":"AAPL", ...}, ...]}
+    Public API endpoint returning trending symbols.
     """
     if not STOCKTWITS_ENABLED:
         return []
@@ -199,6 +215,54 @@ def get_stocktwits_trending() -> List[str]:
             syms.append(sym)
     return syms
 
+# ---- Stocktwits Sentiment (HTML scrape, no auth) ----
+_STW_SENTIMENT_MAP: Dict[str, str] = {
+    "Stocktwits - Sentiment Trending":     "https://stocktwits.com/sentiment",
+    "Stocktwits - Sentiment Most Active":  "https://stocktwits.com/sentiment/most-active",
+    "Stocktwits - Sentiment Watchers":     "https://stocktwits.com/sentiment/watchers",
+    "Stocktwits - Sentiment Most Bullish": "https://stocktwits.com/sentiment/most-bullish",
+    "Stocktwits - Sentiment Most Bearish": "https://stocktwits.com/sentiment/most-bearish",
+    "Stocktwits - Sentiment Top Gainers":  "https://stocktwits.com/sentiment/top-gainers",
+    "Stocktwits - Sentiment Top Losers":   "https://stocktwits.com/sentiment/top-losers",
+}
+
+_SYMBOL_RE = re.compile(r"/symbol/([A-Za-z0-9\.\-_]+)")
+
+def _parse_symbols_from_html(html: str) -> List[str]:
+    # Find all /symbol/{TICKER} links, normalize to uppercase + strip punctuation edges
+    raw = set(m.group(1).upper() for m in _SYMBOL_RE.finditer(html))
+    # Filter obvious non-tickers (defensive; Stocktwits symbols are usually clean)
+    out = []
+    for s in sorted(raw):
+        if 1 <= len(s) <= 12 and not s.startswith("-") and not s.endswith("-"):
+            out.append(s)
+    return out
+
+def get_stocktwits_sentiment_sets() -> List[Tuple[str, List[str]]]:
+    """
+    Scrape the various sentiment pages (Trending/Most Active/Watchers/Bullish/Bearish/Gainers/Losers).
+    Returns list of (source_name, symbols). Each page is fetched independently.
+    """
+    if not STOCKTWITS_SENTIMENT_EN:
+        return []
+
+    sources: List[Tuple[str, List[str]]] = []
+    headers = {
+        **UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://stocktwits.com/sentiment",
+        "Connection": "keep-alive",
+    }
+    for name, url in _STW_SENTIMENT_MAP.items():
+        try:
+            html = fetch_text_with_retries(url, headers=headers, timeout=20, retries=3, backoff_base=0.8)
+            syms = _parse_symbols_from_html(html)
+            logging.info(f"{name}: scraped {len(syms)} symbols.")
+            sources.append((name, syms))
+        except Exception as e:
+            logging.info(f"{name}: skipped due to error: {e}")
+    return sources
+
 # =========================
 # Orchestration
 # =========================
@@ -211,7 +275,6 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
             logging.info(f"{name}: fetched {len(syms)} symbols.")
             sources.append((name, syms))
         except Exception as e:
-            # Downgrade to INFO so occasional site hiccups don’t look alarming
             logging.info(f"{name}: skipped due to error: {e}")
 
     # Stocks (Yahoo — stable)
@@ -227,8 +290,12 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
     try_add("CoinGecko - Trending",         get_coingecko_trending)
     try_add("CoinGecko - Top by Volume",    get_coingecko_top_by_volume)
 
-    # Social (Stocktwits)
-    try_add("Stocktwits - Trending",        get_stocktwits_trending)
+    # Stocktwits (API trending)
+    try_add("Stocktwits - Trending (API)",  get_stocktwits_trending_api)
+
+    # Stocktwits (Sentiment pages — HTML)
+    for name, syms in get_stocktwits_sentiment_sets():
+        sources.append((name, syms))
 
     return sources
 
@@ -249,7 +316,7 @@ def to_rows_for_sheet(sources: List[Tuple[str, List[str]]]) -> List[List[str]]:
 # =========================
 def run_scraper(gc):
     sh = open_sheet(gc)
-    ws_scraper = ensure_worksheet(sh, SCRAPER_WS, rows=5000, cols=6)
+    ws_scraper = ensure_worksheet(sh, SCRAPER_WS, rows=10000, cols=6)
     rows = to_rows_for_sheet(collect_sources())
     append_if_needed(ws_scraper, rows)
 
