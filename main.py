@@ -1,4 +1,4 @@
-import os, json, sys, time, logging, random, re, statistics
+import os, json, sys, time, logging, random, re, statistics, math
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict
 
@@ -46,13 +46,72 @@ GOOGLE_FINANCE_ENABLED    = os.getenv("GOOGLE_FINANCE_ENABLED", "0") not in {"0"
 # Only most-active by default (no gainers/losers wired in)
 GOOGLE_FINANCE_PAGES      = os.getenv("GOOGLE_FINANCE_PAGES", "most-active").split(",")
 
+# Optional: idempotent demo logging and dry-run switch
+DEMO_APPEND_ENABLED       = os.getenv("DEMO_APPEND_ENABLED", "0") not in {"0", "false", "False"}
+DRY_RUN                   = os.getenv("DRY_RUN", "0") not in {"0", "false", "False"}
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
 UA = {"User-Agent": "Mozilla/5.0 (compatible; AletheiaBot/1.0; +https://example.org/bot)"}
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# =========================
+# Optional JSON logs
+# =========================
+class _JsonHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            msg = {
+                "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "lvl": record.levelname,
+                "msg": record.getMessage(),
+                "module": record.module,
+                "func": record.funcName,
+            }
+            sys.stdout.write(json.dumps(msg) + "\n")
+        except Exception:
+            super().emit(record)
+
+if os.getenv("JSON_LOGS", "0") not in {"0", "false", "False"}:
+    logging.getLogger().handlers = []
+    logging.getLogger().addHandler(_JsonHandler())
+    logging.getLogger().setLevel(logging.INFO)
+else:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# =========================
+# HTTP session with retries + pooling
+# =========================
+_session = requests.Session()
+try:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    retry = Retry(
+        total=4,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    _session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20))
+    _session.headers.update(UA)
+except Exception:
+    pass  # gracefully fall back
+
+# simple per-host pacing (token-ish)
+_next_ok_at: Dict[str, float] = {}
+
+def _pace(url: str, base_delay=0.15):
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc
+    now = time.time()
+    wait_until = _next_ok_at.get(host, now)
+    if wait_until > now:
+        time.sleep(wait_until - now)
+    _next_ok_at[host] = time.time() + base_delay * random.uniform(0.9, 1.3)
 
 # =========================
 # Google Sheets helpers
@@ -73,9 +132,15 @@ def ensure_worksheet(sh, title: str, rows: int = 1000, cols: int = 10):
     try:
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
+        if DRY_RUN:
+            logging.info(f"[DRY_RUN] Would create worksheet '{title}'")
+            return sh.add_worksheet(title=title, rows=1, cols=1) if False else sh.worksheet(sh.worksheets()[0].title)
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 def replace_sheet(ws, rows: List[List[str]], header: List[str]):
+    if DRY_RUN:
+        logging.info(f"[DRY_RUN] Would write {len(rows)} rows to '{ws.title}' with header {header}")
+        return
     ws.clear()
     ws.append_row(header, value_input_option="RAW")
     if rows:
@@ -85,7 +150,7 @@ def replace_sheet(ws, rows: List[List[str]], header: List[str]):
     logging.info(f"Wrote {len(rows)} rows to '{ws.title}'.")
 
 # =========================
-# HTTP helpers (429-aware)
+# HTTP helpers (429-aware) using session + pacing
 # =========================
 def _sleep_with_jitter(seconds: float):
     time.sleep(seconds * random.uniform(0.8, 1.2))
@@ -95,7 +160,8 @@ def fetch_json_with_retries(url: str, *, params=None, headers=None, timeout=HTTP
     last_exc = None
     for attempt in range(retries):
         try:
-            r = requests.get(url, params=params, headers=headers or UA, timeout=timeout)
+            _pace(url)
+            r = _session.get(url, params=params, headers=headers or UA, timeout=timeout)
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 delay = float(ra) if ra else backoff_base * (2 ** attempt)
@@ -123,7 +189,8 @@ def fetch_text_with_retries(url: str, *, params=None, headers=None, timeout=HTTP
     last_exc = None
     for attempt in range(retries):
         try:
-            r = requests.get(url, params=params, headers=headers or UA, timeout=timeout)
+            _pace(url)
+            r = _session.get(url, params=params, headers=headers or UA, timeout=timeout)
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 delay = float(ra) if ra else backoff_base * (2 ** attempt)
@@ -143,11 +210,17 @@ def fetch_text_with_retries(url: str, *, params=None, headers=None, timeout=HTTP
 def get_yahoo_trending_stocks() -> List[str]:
     data = fetch_json_with_retries("https://query1.finance.yahoo.com/v1/finance/trending/US")
     out = []
-    for result in data.get("finance", {}).get("result", []):
-        for item in result.get("quotes", []):
-            sym = (item.get("symbol") or "").strip().upper()
-            if sym:
-                out.append(sym)
+    try:
+        for result in data.get("finance", {}).get("result", []) or []:
+            for item in result.get("quotes", []) or []:
+                try:
+                    sym = (item.get("symbol") or "").strip().upper()
+                    if 1 <= len(sym) <= 12:
+                        out.append(sym)
+                except Exception:
+                    continue
+    except Exception:
+        pass
     return out
 
 def get_yahoo_most_active() -> List[str]:
@@ -155,11 +228,17 @@ def get_yahoo_most_active() -> List[str]:
     params = {"scrIds": "most_actives", "count": "100", "lang": "en-US", "region": "US"}
     data = fetch_json_with_retries(url, params=params)
     out = []
-    for res in data.get("finance", {}).get("result", []):
-        for item in res.get("quotes", []):
-            sym = (item.get("symbol") or "").strip().upper()
-            if sym:
-                out.append(sym)
+    try:
+        for res in data.get("finance", {}).get("result", []) or []:
+            for item in (res.get("quotes") or []):
+                try:
+                    sym = (item.get("symbol") or "").strip().upper()
+                    if 1 <= len(sym) <= 12:
+                        out.append(sym)
+                except Exception:
+                    continue
+    except Exception:
+        pass
     return out
 
 # =========================
@@ -201,7 +280,8 @@ def fetch_stocktwits_messages(symbol: str, limit: int) -> List[Dict]:
     return data.get("messages", []) or []
 
 # =========================
-# NEW: Lightweight ticker extraction for arbitrary text
+# Lightweight ticker extraction for arbitrary text
+# (kept as-is per request)
 # =========================
 _TICKER_RE = re.compile(r"\b[A-Z][A-Z0-9\.]{1,4}\b")  # 2–5 chars, allow '.' like BRK.B
 _TICKER_BLACKLIST = {
@@ -217,7 +297,7 @@ def _extract_tickers(text: str) -> List[str]:
     return [c for c in cands if c not in _TICKER_BLACKLIST and 1 < len(c) <= 5]
 
 # =========================
-# NEW: Reddit fetchers (r/wallstreetbets, r/finance, etc.)
+# Reddit fetchers (r/wallstreetbets, r/finance, etc.)
 # =========================
 def _reddit_listing_url(sub: str, sort: str, limit: int, t: str) -> str:
     # e.g. https://www.reddit.com/r/wallstreetbets/hot.json?limit=100&t=day
@@ -260,7 +340,7 @@ def get_reddit_symbols() -> List[str]:
     return sorted(all_syms)
 
 # =========================
-# NEW: Google Finance markets (most-active only by default)
+# Google Finance markets (most-active only by default)
 # =========================
 _GOOG_FIN_BASE = "https://www.google.com/finance/markets/"
 _GOOG_PAGES_MAP = {
@@ -349,9 +429,17 @@ def combine_sources_to_rows(sources: List[Tuple[str, List[str]]]) -> List[List[s
     return [[", ".join(sorted(v)), ts, k] for k, v in sorted(sym_to_src.items())]
 
 # =========================
-# Sentiment analysis (stocks)
+# Sentiment analysis (stocks) + ranking
 # =========================
 _analyzer = SentimentIntensityAnalyzer()
+
+def _trimmed_mean(vals: List[float], p: float = 0.1) -> float:
+    if not vals:
+        return 0.0
+    vals = sorted(vals)
+    k = max(0, int(len(vals) * p))
+    core = vals[k:len(vals) - k] or vals
+    return round(sum(core) / len(core), 4)
 
 def score_messages(msgs: List[Dict]) -> Dict:
     scores, pos, neg, neu = [], 0, 0, 0
@@ -361,18 +449,24 @@ def score_messages(msgs: List[Dict]) -> Dict:
             continue
         c = _analyzer.polarity_scores(text)["compound"]
         scores.append(c)
-        if c >= 0.05: pos += 1
-        elif c <= -0.05: neg += 1
-        else: neu += 1
-    if not scores:
-        return {"mean": 0, "median": 0, "n": 0, "pos": 0, "neg": 0, "neu": 0}
+        if c >= 0.05:
+            pos += 1
+        elif c <= -0.05:
+            neg += 1
+        else:
+            neu += 1
+    n = len(scores)
+    if not n:
+        return {"mean": 0, "median": 0, "tmean": 0, "n": 0, "pos": 0, "neg": 0, "neu": 0, "delta": 0}
     return {
-        "mean": round(sum(scores)/len(scores), 4),
+        "mean": round(sum(scores) / n, 4),
         "median": round(statistics.median(scores), 4),
-        "n": len(scores),
-        "pos": round(pos/len(scores), 4),
-        "neg": round(neg/len(scores), 4),
-        "neu": round(neu/len(scores), 4),
+        "tmean": _trimmed_mean(scores, 0.1),
+        "n": n,
+        "pos": round(pos / n, 4),
+        "neg": round(neg / n, 4),
+        "neu": round(neu / n, 4),
+        "delta": round((pos - neg) / n, 4),  # bull - bear density
     }
 
 # =========================
@@ -380,12 +474,16 @@ def score_messages(msgs: List[Dict]) -> Dict:
 # =========================
 def apply_sentiment_conditional_formats(ws):
     set_frozen(ws, rows=1)
+    # Column map:
+    # A:symbol B:mean C:median D:trim_mean E:n_msgs F:pos G:neg H:neu I:delta J:source_hits K:msgs_factor L:rank M:scored_at_utc
     format_cell_ranges(ws, [
-        ("B2:B", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
-        ("C2:C", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
-        ("E2:E", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
-        ("F2:F", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
-        ("G2:G", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
+        ("B2:D", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
+        ("E2:E", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
+        ("F2:H", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
+        ("I2:I", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
+        ("J2:J", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
+        ("K2:K", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
+        ("L2:L", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.000"))),
     ])
 
     red, white, green = Color(0.9, 0.2, 0.2), Color(1, 1, 1), Color(0.2, 0.7, 0.2)
@@ -402,13 +500,18 @@ def apply_sentiment_conditional_formats(ws):
 
     rules = get_conditional_format_rules(ws)
     rules.clear()
-    # Mean/Median: -1 → 0 → +1
+    # Mean/Median/Trimmed: -1 → 0 → +1
     rules.append(rule("B2:B", -1, 0, 1))
     rules.append(rule("C2:C", -1, 0, 1))
+    rules.append(rule("D2:D", -1, 0, 1))
     # Positive ratio: greener when higher
-    rules.append(rule("E2:E", 0, 0.5, 1))
+    rules.append(rule("F2:F", 0, 0.5, 1))
     # Negative ratio: redder when higher (invert gradient)
-    rules.append(rule("F2:F", 0, 0.5, 1, invert=True))
+    rules.append(rule("G2:G", 0, 0.5, 1, invert=True))
+    # Delta (bull-bear): -1 → 0 → +1
+    rules.append(rule("I2:I", -1, 0, 1))
+    # Rank: -1 → 0 → +1 (rank will generally be >=0 but keep symmetric color)
+    rules.append(rule("L2:L", -1, 0, 1))
     rules.save()
 
 # =========================
@@ -429,17 +532,47 @@ def run_sentiment(gc):
     ws_scraper = ensure_worksheet(sh, SCRAPER_WS)
     data = ws_scraper.get_all_values()
     if len(data) <= 1:
+        logging.info("No scraper data found.")
         return
-    _, *rows = data
-    syms = sorted({r[2].strip().upper() for r in rows if len(r) >= 3})[:SENTIMENT_SYMBOL_LIMIT]
+    header, *rows = data
+
+    # Build coverage map from scraper sheet (first column contains comma-separated sources)
+    source_map: Dict[str, int] = {}
+    for r in rows:
+        if len(r) >= 3:
+            sources_str = (r[0] or "").strip()
+            sym = r[2].strip().upper()
+            if not sym:
+                continue
+            if sources_str:
+                hits = len([s for s in [x.strip() for x in sources_str.split(",")] if s])
+            else:
+                hits = 1
+            source_map[sym] = hits
+
+    # Collect symbols (unique), cap to limit
+    syms = sorted({r[2].strip().upper() for r in rows if len(r) >= 3 and r[2].strip()})[:SENTIMENT_SYMBOL_LIMIT]
+
     out = []
     for i, s in enumerate(syms, 1):
         try:
             msgs = fetch_stocktwits_messages(s, SENTIMENT_MSGS_PER_SYM)
             sc = score_messages(msgs)
+
+            coverage = source_map.get(s, 1)
+            sent = 0.6 * sc["tmean"] + 0.4 * sc["median"]
+            momentum = sc["delta"]
+            msgs_factor = min(1.0, sc["n"] / max(1, SENTIMENT_MSGS_PER_SYM))
+
+            # Composite rank (simple, tunable)
+            coverage_term = math.log10(1 + coverage)  # 0.. ~
+            rank = 0.5 * coverage_term + 0.35 * sent + 0.15 * momentum
+            rank = round(rank, 4)
+
             out.append([
-                s, sc["mean"], sc["median"], sc["n"],
-                sc["pos"], sc["neg"], sc["neu"],
+                s, sc["mean"], sc["median"], sc["tmean"], sc["n"],
+                sc["pos"], sc["neg"], sc["neu"], sc["delta"],
+                coverage, round(msgs_factor, 4), rank,
                 datetime.now(timezone.utc).isoformat()
             ])
         except Exception as e:
@@ -447,13 +580,31 @@ def run_sentiment(gc):
         if i % 25 == 0:
             logging.info(f"Processed {i}/{len(syms)}")
         _sleep_with_jitter(SENTIMENT_REQ_SLEEP_S)
-    ws = ensure_worksheet(sh, SENTIMENT_WS, 5000, 10)
-    replace_sheet(ws, out, ["symbol","mean_compound","median_compound","n_msgs","pos_ratio","neg_ratio","neu_ratio","scored_at_utc"])
+
+    ws = ensure_worksheet(sh, SENTIMENT_WS, 5000, 16)
+    replace_sheet(ws, out, [
+        "symbol","mean_comp","median_comp","trim_mean","n_msgs",
+        "pos_ratio","neg_ratio","neu_ratio","bull_bear_delta",
+        "source_hits","msgs_factor","rank","scored_at_utc"
+    ])
+
     apply_sentiment_conditional_formats(ws)
 
+    # Try to enable basic filter; ignore if unsupported
+    try:
+        if not DRY_RUN:
+            ws.set_basic_filter()
+    except Exception:
+        pass
+
 def run_demo(gc):
+    if not DEMO_APPEND_ENABLED:
+        return
     sh = open_sheet(gc)
     ws = ensure_worksheet(sh, WORKSHEET)
+    if DRY_RUN:
+        logging.info("[DRY_RUN] Would append demo row")
+        return
     ws.append_row(["Deployed OK", datetime.now(timezone.utc).isoformat()], value_input_option="RAW")
 
 def main():
