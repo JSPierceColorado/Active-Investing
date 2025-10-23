@@ -2,3 +2,4 @@ gspread==6.0.2
 google-auth==2.35.0
 requests==2.32.3
 vaderSentiment==3.3.2
+gspread-formatting==1.2.0
