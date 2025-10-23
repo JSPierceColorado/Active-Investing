@@ -1,6 +1,6 @@
 import os, json, sys, time, logging, random, re, statistics
 from datetime import datetime, timezone
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict
 
 import requests
 import gspread
@@ -21,23 +21,19 @@ SHEET_NAME      = os.getenv("SHEET_NAME", "Trading Log")
 WORKSHEET       = os.getenv("WORKSHEET", "log")
 SCRAPER_WS      = os.getenv("SCRAPER_WS", "scraper")
 SENTIMENT_WS    = os.getenv("SENTIMENT_WS", "sentiment")
-CRYPTO_SENT_WS  = os.getenv("CRYPTO_SENT_WS", "crypto_sentiment")
 
 HTTP_TIMEOUT    = int(os.getenv("HTTP_TIMEOUT", "15"))
 
+# Feature flags (kept for flexibility; NASDAQ flag currently unused)
 NASDAQ_ENABLED            = os.getenv("NASDAQ_ENABLED", "0") not in {"0", "false", "False"}
 STOCKTWITS_ENABLED        = os.getenv("STOCKTWITS_ENABLED", "1") not in {"0", "false", "False"}
 STOCKTWITS_SENTIMENT_EN   = os.getenv("STOCKTWITS_SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
 
+# Sentiment params
 SENTIMENT_ENABLED          = os.getenv("SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
 SENTIMENT_SYMBOL_LIMIT     = int(os.getenv("SENTIMENT_SYMBOL_LIMIT", "150"))
 SENTIMENT_MSGS_PER_SYM     = int(os.getenv("SENTIMENT_MSGS_PER_SYM", "30"))
 SENTIMENT_REQ_SLEEP_S      = float(os.getenv("SENTIMENT_REQ_SLEEP_S", "0.25"))
-
-CRYPTO_SENT_ENABLED        = os.getenv("CRYPTO_SENT_ENABLED", "1") not in {"0", "false", "False"}
-CRYPTO_SENT_SYMBOL_LIMIT   = int(os.getenv("CRYPTO_SENT_SYMBOL_LIMIT", "120"))
-CRYPTO_REQ_SLEEP_S         = float(os.getenv("CRYPTO_REQ_SLEEP_S", "0.35"))
-COINGECKO_IDS_BATCH        = 180
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -131,7 +127,7 @@ def fetch_text_with_retries(url: str, *, params=None, headers=None, timeout=HTTP
     raise last_exc
 
 # =========================
-# Fetchers: Yahoo / CoinGecko / Stocktwits
+# Fetchers: Yahoo / Stocktwits (crypto removed)
 # =========================
 def get_yahoo_trending_stocks() -> List[str]:
     data = fetch_json_with_retries("https://query1.finance.yahoo.com/v1/finance/trending/US")
@@ -154,21 +150,6 @@ def get_yahoo_most_active() -> List[str]:
             if sym:
                 out.append(sym)
     return out
-
-def get_coingecko_trending() -> List[str]:
-    data = fetch_json_with_retries("https://api.coingecko.com/api/v3/search/trending")
-    out = []
-    for it in data.get("coins", []):
-        sym = ((it.get("item") or {}).get("symbol") or "").strip().upper()
-        if sym:
-            out.append(sym)
-    return out
-
-def get_coingecko_top_by_volume(limit: int = 50) -> List[str]:
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {"vs_currency": "usd", "order": "volume_desc", "per_page": str(limit), "page": "1"}
-    data = fetch_json_with_retries(url, params=params)
-    return [(coin.get("symbol") or "").strip().upper() for coin in data]
 
 # =========================
 # Stocktwits
@@ -212,7 +193,8 @@ def fetch_stocktwits_messages(symbol: str, limit: int) -> List[Dict]:
 # Scraper orchestration
 # =========================
 def collect_sources() -> List[Tuple[str, List[str]]]:
-    sources = []
+    sources: List[Tuple[str, List[str]]] = []
+
     def try_add(name, fn):
         try:
             syms = fn()
@@ -221,17 +203,18 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
         except Exception as e:
             logging.info(f"{name}: skipped ({e})")
 
+    # Stocks only
     try_add("Yahoo Finance - Trending (US)", get_yahoo_trending_stocks)
     try_add("Yahoo Finance - Most Active", get_yahoo_most_active)
-    try_add("CoinGecko - Trending", get_coingecko_trending)
-    try_add("CoinGecko - Top by Volume", get_coingecko_top_by_volume)
+
+    # Stocktwits sentiment lists (symbols only; scoring happens later)
     for name, syms in get_stocktwits_sentiment_sets():
         sources.append((name, syms))
     return sources
 
 def combine_sources_to_rows(sources: List[Tuple[str, List[str]]]) -> List[List[str]]:
     ts = datetime.now(timezone.utc).isoformat()
-    sym_to_src = {}
+    sym_to_src: Dict[str, set] = {}
     for src, syms in sources:
         for s in syms:
             sym_to_src.setdefault(s, set()).add(src)
@@ -310,6 +293,10 @@ def run_scraper(gc):
     replace_sheet(ws, data, ["source","date_utc","symbol"])
 
 def run_sentiment(gc):
+    if not SENTIMENT_ENABLED:
+        logging.info("Sentiment disabled via SENTIMENT_ENABLED=0")
+        return
+
     sh = open_sheet(gc)
     ws_scraper = ensure_worksheet(sh, SCRAPER_WS)
     data = ws_scraper.get_all_values()
@@ -322,7 +309,11 @@ def run_sentiment(gc):
         try:
             msgs = fetch_stocktwits_messages(s, SENTIMENT_MSGS_PER_SYM)
             sc = score_messages(msgs)
-            out.append([s, sc["mean"], sc["median"], sc["n"], sc["pos"], sc["neg"], sc["neu"], datetime.now(timezone.utc).isoformat()])
+            out.append([
+                s, sc["mean"], sc["median"], sc["n"],
+                sc["pos"], sc["neg"], sc["neu"],
+                datetime.now(timezone.utc).isoformat()
+            ])
         except Exception as e:
             logging.info(f"{s} sentiment skip: {e}")
         if i % 25 == 0:
