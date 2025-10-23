@@ -1,6 +1,6 @@
 import os, json, sys, time, logging, random, re
 from datetime import datetime, timezone
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Set
 
 import requests
 import gspread
@@ -48,26 +48,17 @@ def ensure_worksheet(sh, title: str, rows: int = 1000, cols: int = 10):
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
-def append_if_needed(ws, rows: List[List[str]]):
+def replace_sheet(ws, rows: List[List[str]]):
     """
-    Append rows to ws. Creates header if the sheet is empty.
-    Deduplicates by the first 3 columns: [source, date_utc, symbol].
+    Replace the sheet with header + provided rows.
     """
-    existing = ws.get_all_values()
-    if not existing:
-        ws.append_row(["source", "date_utc", "symbol"], value_input_option="RAW")
-        existing = ws.get_all_values()
-
-    existing_set = set(tuple(r[:3]) for r in existing[1:]) if len(existing) > 1 else set()
-    new_rows = [r for r in rows if tuple(r[:3]) not in existing_set]
-
-    if new_rows:
+    ws.clear()
+    ws.append_row(["source", "date_utc", "symbol"], value_input_option="RAW")
+    if rows:
         CHUNK = 500
-        for i in range(0, len(new_rows), CHUNK):
-            ws.append_rows(new_rows[i:i+CHUNK], value_input_option="RAW")
-        logging.info(f"Appended {len(new_rows)} new rows to '{ws.title}'.")
-    else:
-        logging.info("No new rows to append (all deduplicated).")
+        for i in range(0, len(rows), CHUNK):
+            ws.append_rows(rows[i:i+CHUNK], value_input_option="RAW")
+    logging.info(f"Wrote {len(rows)} rows to '{ws.title}' (replaced with latest scrape).")
 
 # =========================
 # HTTP helpers (retry/backoff)
@@ -229,9 +220,7 @@ _STW_SENTIMENT_MAP: Dict[str, str] = {
 _SYMBOL_RE = re.compile(r"/symbol/([A-Za-z0-9\.\-_]+)")
 
 def _parse_symbols_from_html(html: str) -> List[str]:
-    # Find all /symbol/{TICKER} links, normalize to uppercase + strip punctuation edges
     raw = set(m.group(1).upper() for m in _SYMBOL_RE.finditer(html))
-    # Filter obvious non-tickers (defensive; Stocktwits symbols are usually clean)
     out = []
     for s in sorted(raw):
         if 1 <= len(s) <= 12 and not s.startswith("-") and not s.endswith("-"):
@@ -239,13 +228,8 @@ def _parse_symbols_from_html(html: str) -> List[str]:
     return out
 
 def get_stocktwits_sentiment_sets() -> List[Tuple[str, List[str]]]:
-    """
-    Scrape the various sentiment pages (Trending/Most Active/Watchers/Bullish/Bearish/Gainers/Losers).
-    Returns list of (source_name, symbols). Each page is fetched independently.
-    """
     if not STOCKTWITS_SENTIMENT_EN:
         return []
-
     sources: List[Tuple[str, List[str]]] = []
     headers = {
         **UA,
@@ -267,6 +251,9 @@ def get_stocktwits_sentiment_sets() -> List[Tuple[str, List[str]]]:
 # Orchestration
 # =========================
 def collect_sources() -> List[Tuple[str, List[str]]]:
+    """
+    Returns a list of (source_name, symbols) from all enabled sources.
+    """
     sources: List[Tuple[str, List[str]]] = []
 
     def try_add(name: str, fn):
@@ -299,17 +286,29 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
 
     return sources
 
-def to_rows_for_sheet(sources: List[Tuple[str, List[str]]]) -> List[List[str]]:
+def combine_sources_to_rows(sources: List[Tuple[str, List[str]]]) -> List[List[str]]:
+    """
+    Combine all sources into unique symbols, merging their source names.
+    Output rows: [combined_sources, date_utc, symbol]
+    """
     ts = datetime.now(timezone.utc).isoformat()
-    out: List[List[str]] = []
+    symbol_to_sources: Dict[str, Set[str]] = {}
+
     for source, symbols in sources:
-        seen = set()
         for sym in symbols:
             s = sym.strip().upper()
-            if s and s not in seen:
-                out.append([source, ts, s])
-                seen.add(s)
-    return out
+            if not s:
+                continue
+            if s not in symbol_to_sources:
+                symbol_to_sources[s] = set()
+            symbol_to_sources[s].add(source)
+
+    # Build rows, sorted by symbol for readability
+    rows: List[List[str]] = []
+    for symbol in sorted(symbol_to_sources.keys()):
+        combined_source = ", ".join(sorted(symbol_to_sources[symbol]))
+        rows.append([combined_source, ts, symbol])
+    return rows
 
 # =========================
 # Entry points
@@ -317,8 +316,10 @@ def to_rows_for_sheet(sources: List[Tuple[str, List[str]]]) -> List[List[str]]:
 def run_scraper(gc):
     sh = open_sheet(gc)
     ws_scraper = ensure_worksheet(sh, SCRAPER_WS, rows=10000, cols=6)
-    rows = to_rows_for_sheet(collect_sources())
-    append_if_needed(ws_scraper, rows)
+    # Collect + combine (dedupe across sources), then replace sheet with latest scrape only
+    sources = collect_sources()
+    rows = combine_sources_to_rows(sources)
+    replace_sheet(ws_scraper, rows)
 
 def run_demo_write(gc):
     sh = open_sheet(gc)
