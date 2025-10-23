@@ -1,15 +1,19 @@
-import os, json, sys, time, logging
+import os, json, sys, time, logging, random
 from datetime import datetime, timezone
-from typing import List, Tuple, Iterable, Dict
+from typing import List, Tuple, Dict, Iterable, Optional
+
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-# -------- Config --------
-SHEET_NAME = os.getenv("SHEET_NAME", "Trading Log")
-WORKSHEET  = os.getenv("WORKSHEET", "log")          # still used by your original write
-SCRAPER_WS = os.getenv("SCRAPER_WS", "scraper")     # new tab for scraped symbols
+# =========================
+# Config
+# =========================
+SHEET_NAME  = os.getenv("SHEET_NAME", "Trading Log")
+WORKSHEET   = os.getenv("WORKSHEET", "log")           # original demo write
+SCRAPER_WS  = os.getenv("SCRAPER_WS", "scraper")      # new scraping tab
 HTTP_TIMEOUT = 15
+NASDAQ_ENABLED = os.getenv("NASDAQ_ENABLED", "1") not in {"0", "false", "False"}
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -21,7 +25,9 @@ UA = {"User-Agent": "Mozilla/5.0 (compatible; AletheiaBot/1.0; +https://example.
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
-# -------- Google Sheets helpers --------
+# =========================
+# Google Sheets helpers
+# =========================
 def get_client():
     creds_json = os.environ.get("GOOGLE_CREDS_JSON")
     if not creds_json:
@@ -32,6 +38,7 @@ def get_client():
     return gspread.authorize(creds)
 
 def open_sheet(gc):
+    # If you prefer an ID: use gc.open_by_key(os.environ["SHEET_ID"])
     return gc.open(SHEET_NAME)
 
 def ensure_worksheet(sh, title: str, rows: int = 1000, cols: int = 10):
@@ -41,17 +48,19 @@ def ensure_worksheet(sh, title: str, rows: int = 1000, cols: int = 10):
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 def append_if_needed(ws, rows: List[List[str]]):
-    """Append rows to ws. Creates header if the sheet is empty."""
+    """
+    Append rows to ws. Creates header if the sheet is empty.
+    Deduplicates by the first 3 columns: [source, date_utc, symbol].
+    """
     existing = ws.get_all_values()
     if not existing:
         ws.append_row(["source", "date_utc", "symbol"], value_input_option="RAW")
+        existing = ws.get_all_values()  # refresh
 
-    # Build a set of existing triplets to avoid dup inserts within/accross runs
     existing_set = set(tuple(r[:3]) for r in existing[1:]) if len(existing) > 1 else set()
-
     new_rows = [r for r in rows if tuple(r[:3]) not in existing_set]
+
     if new_rows:
-        # Batch in chunks to avoid request size limits
         CHUNK = 500
         for i in range(0, len(new_rows), CHUNK):
             ws.append_rows(new_rows[i:i+CHUNK], value_input_option="RAW")
@@ -60,101 +69,136 @@ def append_if_needed(ws, rows: List[List[str]]):
         logging.info("No new rows to append (all deduplicated).")
 
 
-# -------- Fetchers (Stocks) --------
+# =========================
+# HTTP helpers (retry/backoff)
+# =========================
+def fetch_json_with_retries(
+    url: str,
+    *,
+    params: Optional[Dict] = None,
+    headers: Optional[Dict] = None,
+    timeout: int = HTTP_TIMEOUT,
+    retries: int = 3,
+    backoff_base: float = 0.6,
+) -> Dict:
+    """
+    Basic jittered exponential backoff: ~0.6s, ~1.2s, ~2.4s (jittered).
+    Raises the last exception if all retries fail.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_exc = e
+            sleep_s = backoff_base * (2 ** attempt) * (0.8 + 0.4 * random.random())
+            time.sleep(sleep_s)
+    raise last_exc
+
+
+# =========================
+# Fetchers: Stocks
+# =========================
 def get_yahoo_trending_stocks() -> List[str]:
     """
     Yahoo Finance trending tickers (US).
-    Endpoint returns symbols directly.
     """
-    url = "https://query1.finance.yahoo.com/v1/finance/trending/US?lang=en-US&region=US"
-    r = requests.get(url, headers=UA, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    symbols = []
+    url = "https://query1.finance.yahoo.com/v1/finance/trending/US"
+    data = fetch_json_with_retries(url, headers=UA, timeout=15, retries=3)
+    symbols: List[str] = []
     for result in data.get("finance", {}).get("result", []):
         for item in result.get("quotes", []):
-            sym = item.get("symbol")
+            sym = (item.get("symbol") or "").strip().upper()
             if sym:
-                symbols.append(sym.upper())
+                symbols.append(sym)
     return symbols
 
 def get_yahoo_most_active() -> List[str]:
     """
-    Yahoo Finance predefined screener: most actives.
+    Yahoo predefined screener: most actives (top ~100).
     """
     url = "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
-    params = {"scrIds": "most_actives", "count": "100"}
-    r = requests.get(url, headers=UA, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    symbols = []
+    params = {"scrIds": "most_actives", "count": "100", "lang": "en-US", "region": "US"}
+    data = fetch_json_with_retries(url, params=params, headers=UA, timeout=15, retries=3)
+    symbols: List[str] = []
     for res in data.get("finance", {}).get("result", []):
         for item in res.get("quotes", []):
-            sym = item.get("symbol")
+            sym = (item.get("symbol") or "").strip().upper()
             if sym:
-                symbols.append(sym.upper())
+                symbols.append(sym)
     return symbols
 
 def get_nasdaq_most_active() -> List[str]:
     """
-    Nasdaq most-active API. Sometimes rate-limited; wrapped in try/except.
+    Nasdaq most-active. Endpoint can be temperamental; use stricter headers & retries.
+    Toggle via NASDAQ_ENABLED=0 to disable gracefully.
     """
+    if not NASDAQ_ENABLED:
+        return []
+
     url = "https://api.nasdaq.com/api/quote/list-type/mostactive"
-    headers = {**UA, "Accept": "application/json"}
+    headers = {
+        **UA,
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.nasdaq.com",
+        "Referer": "https://www.nasdaq.com/market-activity/most-active",
+        "Connection": "keep-alive",
+    }
     params = {"assetclass": "stocks"}
-    r = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    items = data.get("data", {}).get("data", [])
-    symbols = []
+    data = fetch_json_with_retries(url, params=params, headers=headers, timeout=25, retries=3, backoff_base=0.8)
+
+    items = (data.get("data") or {}).get("data") or []
+    symbols: List[str] = []
     for row in items:
-        sym = row.get("symbol")
+        sym = (row.get("symbol") or "").strip().upper()
         if sym:
-            symbols.append(sym.upper())
+            symbols.append(sym)
     return symbols
 
 
-# -------- Fetchers (Crypto) --------
+# =========================
+# Fetchers: Crypto
+# =========================
 def get_coingecko_trending() -> List[str]:
     """
-    CoinGecko trending search endpoint (top ~7).
+    CoinGecko trending search endpoint (~7 coins).
     """
     url = "https://api.coingecko.com/api/v3/search/trending"
-    r = requests.get(url, headers=UA, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    symbols = []
+    data = fetch_json_with_retries(url, headers=UA, timeout=15, retries=3)
+    symbols: List[str] = []
     for it in data.get("coins", []):
-        sym = it.get("item", {}).get("symbol")
+        sym = ((it.get("item") or {}).get("symbol") or "").strip().upper()
         if sym:
-            symbols.append(sym.upper())
+            symbols.append(sym)
     return symbols
 
 def get_coingecko_top_by_volume(limit: int = 50) -> List[str]:
     """
-    CoinGecko markets by volume (USD).
+    CoinGecko top by trading volume (USD).
     """
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {"vs_currency": "usd", "order": "volume_desc", "per_page": str(limit), "page": "1"}
-    r = requests.get(url, headers=UA, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    symbols = []
+    data = fetch_json_with_retries(url, params=params, headers=UA, timeout=15, retries=3)
+    symbols: List[str] = []
     for coin in data:
-        sym = coin.get("symbol")
+        sym = (coin.get("symbol") or "").strip().upper()
         if sym:
-            symbols.append(sym.upper())
+            symbols.append(sym)
     return symbols
 
 
-# -------- Orchestration --------
+# =========================
+# Orchestration
+# =========================
 def collect_sources() -> List[Tuple[str, List[str]]]:
     """
     Return list of (source_name, symbols) pairs. Each source is tried independently.
     """
-    sources = []
+    sources: List[Tuple[str, List[str]]] = []
 
-    def try_add(name, fn):
+    def try_add(name: str, fn):
         try:
             syms = fn()
             logging.info(f"{name}: fetched {len(syms)} symbols.")
@@ -189,16 +233,19 @@ def to_rows_for_sheet(sources: List[Tuple[str, List[str]]]) -> List[List[str]]:
     return out
 
 
-# -------- Main --------
+# =========================
+# Entry points
+# =========================
 def run_scraper(gc):
     sh = open_sheet(gc)
     ws_scraper = ensure_worksheet(sh, SCRAPER_WS, rows=5000, cols=6)
-    sources = collect_sources()
-    rows = to_rows_for_sheet(sources)
+    rows = to_rows_for_sheet(collect_sources())
     append_if_needed(ws_scraper, rows)
 
 def run_demo_write(gc):
-    """Keep your original behavior for the 'log' tab so you still see a heartbeat write."""
+    """
+    Keep your original behavior for the 'log' tab so you still see a heartbeat write.
+    """
     sh = open_sheet(gc)
     ws = ensure_worksheet(sh, WORKSHEET, rows=200, cols=10)
     ts = datetime.now(timezone.utc).isoformat()
