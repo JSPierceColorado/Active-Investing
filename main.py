@@ -25,14 +25,15 @@ STOCKTWITS_SENTIMENT_EN  = os.getenv("STOCKTWITS_SENTIMENT_ENABLED", "1") not in
 
 # Sentiment toggles/limits
 SENTIMENT_ENABLED         = os.getenv("SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
-SENTIMENT_SYMBOL_LIMIT    = int(os.getenv("SENTIMENT_SYMBOL_LIMIT", "150"))    # max symbols to VADER-score per run (stocks)
+SENTIMENT_SYMBOL_LIMIT    = int(os.getenv("SENTIMENT_SYMBOL_LIMIT", "150"))    # max stock symbols to VADER-score
 SENTIMENT_MSGS_PER_SYM    = int(os.getenv("SENTIMENT_MSGS_PER_SYM", "30"))     # Stocktwits messages per stock symbol
 SENTIMENT_REQ_SLEEP_S     = float(os.getenv("SENTIMENT_REQ_SLEEP_S", "0.25"))  # throttle between Stocktwits calls
 
-# Crypto sentiment limits
+# Crypto sentiment limits (more conservative to avoid 429)
 CRYPTO_SENT_ENABLED       = os.getenv("CRYPTO_SENT_ENABLED", "1") not in {"0", "false", "False"}
-CRYPTO_SENT_SYMBOL_LIMIT  = int(os.getenv("CRYPTO_SENT_SYMBOL_LIMIT", "200"))  # max crypto symbols to score
-COINGECKO_IDS_BATCH       = 200  # batch size for /coins/markets by ids
+CRYPTO_SENT_SYMBOL_LIMIT  = int(os.getenv("CRYPTO_SENT_SYMBOL_LIMIT", "120"))  # cap how many cryptos per run
+CRYPTO_REQ_SLEEP_S        = float(os.getenv("CRYPTO_REQ_SLEEP_S", "0.35"))     # delay between CoinGecko detail calls
+COINGECKO_IDS_BATCH       = 180  # batch size for /coins/markets by ids (<= 250 per docs, keep margin)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -73,21 +74,43 @@ def replace_sheet(ws, rows: List[List[str]], header: List[str]):
     logging.info(f"Wrote {len(rows)} rows to '{ws.title}'.")
 
 # =========================
-# HTTP helpers (retry/backoff)
+# HTTP helpers (retry/backoff with 429 handling)
 # =========================
+def _sleep_with_jitter(seconds: float):
+    # +/- 20% jitter to avoid thundering herd
+    jitter = seconds * random.uniform(0.8, 1.2)
+    time.sleep(jitter)
+
 def fetch_json_with_retries(
     url: str, *, params=None, headers=None, timeout=HTTP_TIMEOUT,
-    retries=3, backoff_base=0.6
+    retries=4, backoff_base=0.7
 ) -> Dict:
     last_exc = None
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, headers=headers or UA, timeout=timeout)
+            # Handle 429 before raise_for_status so we can honor Retry-After
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else backoff_base * (2 ** attempt)
+                logging.info(f"429 at {url} — sleeping {delay:.2f}s")
+                _sleep_with_jitter(delay)
+                continue
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            last_exc = e
+            status = getattr(e.response, "status_code", None)
+            if status == 429:
+                retry_after = e.response.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else backoff_base * (2 ** attempt)
+                logging.info(f"HTTPError 429 at {url} — sleeping {delay:.2f}s")
+                _sleep_with_jitter(delay)
+                continue
+            _sleep_with_jitter(backoff_base * (2 ** attempt))
         except Exception as e:
             last_exc = e
-            time.sleep(backoff_base * (2 ** attempt) * (0.8 + 0.4 * random.random()))
+            _sleep_with_jitter(backoff_base * (2 ** attempt))
     raise last_exc
 
 def fetch_text_with_retries(
@@ -98,11 +121,27 @@ def fetch_text_with_retries(
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, headers=headers or UA, timeout=timeout)
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else backoff_base * (2 ** attempt)
+                logging.info(f"429 at {url} — sleeping {delay:.2f}s")
+                _sleep_with_jitter(delay)
+                continue
             r.raise_for_status()
             return r.text
+        except requests.exceptions.HTTPError as e:
+            last_exc = e
+            status = getattr(e.response, "status_code", None)
+            if status == 429:
+                retry_after = e.response.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else backoff_base * (2 ** attempt)
+                logging.info(f"HTTPError 429 at {url} — sleeping {delay:.2f}s")
+                _sleep_with_jitter(delay)
+                continue
+            _sleep_with_jitter(backoff_base * (2 ** attempt))
         except Exception as e:
             last_exc = e
-            time.sleep(backoff_base * (2 ** attempt) * (0.8 + 0.4 * random.random()))
+            _sleep_with_jitter(backoff_base * (2 ** attempt))
     raise last_exc
 
 # =========================
@@ -331,7 +370,6 @@ def coingecko_markets_for_ids(ids: List[str]) -> Dict[str, Dict]:
     out: Dict[str, Dict] = {}
     if not ids:
         return out
-    # Batch because 'ids' param is comma-limited.
     for i in range(0, len(ids), COINGECKO_IDS_BATCH):
         chunk = ids[i:i+COINGECKO_IDS_BATCH]
         url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -340,29 +378,17 @@ def coingecko_markets_for_ids(ids: List[str]) -> Dict[str, Dict]:
         for row in data:
             cid = row.get("id")
             out[cid] = {"market_cap_rank": row.get("market_cap_rank")}
-        # be nice to the API
-        time.sleep(0.2)
+        _sleep_with_jitter(0.2)
     return out
-
-def coingecko_coin_community(cid: str) -> Dict:
-    """
-    Fetch /coins/{id} with community_data only.
-    """
-    url = f"https://api.coingecko.com/api/v3/coins/{cid}"
-    params = {
-        "localization": "false",
-        "tickers": "false",
-        "market_data": "false",
-        "community_data": "true",
-        "developer_data": "false",
-        "sparkline": "false",
-    }
-    return fetch_json_with_retries(url, params=params)
 
 def map_symbols_to_coingecko_ids(symbols: List[str]) -> Dict[str, str]:
     """
     Map uppercase symbols -> best CoinGecko id (by lowest market_cap_rank) when multiple IDs share the same symbol.
+    Only for symbols length >= 3 (reduce collisions with stocks).
     """
+    # Filter defensively
+    symbols = [s for s in symbols if s and len(s) >= 3]
+
     all_coins = coingecko_all_coins_list()  # [{id,symbol,name}, ...]
     sym_to_ids: Dict[str, List[str]] = {}
     for c in all_coins:
@@ -372,11 +398,7 @@ def map_symbols_to_coingecko_ids(symbols: List[str]) -> Dict[str, str]:
             continue
         sym_to_ids.setdefault(sym, []).append(cid)
 
-    # Candidate ids per requested symbol
     candidates: Dict[str, List[str]] = {s: sym_to_ids.get(s, []) for s in symbols}
-
-    # Choose best id by market_cap_rank (if available)
-    # Gather all candidate ids to fetch ranks in one go
     all_ids = sorted({cid for ids in candidates.values() for cid in ids})
     ranks = coingecko_markets_for_ids(all_ids)  # {id: {market_cap_rank: int}}
 
@@ -384,7 +406,6 @@ def map_symbols_to_coingecko_ids(symbols: List[str]) -> Dict[str, str]:
     for s, ids in candidates.items():
         if not ids:
             continue
-        # pick id with smallest positive rank; fallback to first
         best = None
         best_rank = 10**9
         for cid in ids:
@@ -401,9 +422,7 @@ def map_symbols_to_coingecko_ids(symbols: List[str]) -> Dict[str, str]:
 def run_scraper(gc):
     sh = open_sheet(gc)
     ws = ensure_worksheet(sh, SCRAPER_WS, rows=10000, cols=6)
-    # --- collect sources ---
     sources = collect_sources()
-    # --- latest-only, deduped ---
     rows = combine_sources_to_rows(sources)
     replace_sheet(ws, rows, ["source", "date_utc", "symbol"])
 
@@ -422,9 +441,10 @@ def run_stock_sentiment(gc, crypto_symbol_set: Set[str]):
         return
 
     header, *rows = data
-    # Only symbols NOT recognized as crypto → avoid 404s like AAVE on Stocktwits
-    all_syms = [r[2].strip().upper() for r in rows if len(r) >= 3 and r[2].strip()]
-    stock_syms = [s for s in sorted(set(all_syms)) if s not in crypto_symbol_set][:SENTIMENT_SYMBOL_LIMIT]
+    # Columns: 0=combined_sources, 1=date_utc, 2=symbol
+    all_syms = [(r[0], r[2].strip().upper()) for r in rows if len(r) >= 3 and r[2].strip()]
+    # STOCKS ONLY: not identified as crypto
+    stock_syms = sorted({sym for srcs, sym in all_syms if sym not in crypto_symbol_set})[:SENTIMENT_SYMBOL_LIMIT]
 
     out_rows: List[List[str]] = []
     for i, sym in enumerate(stock_syms, 1):
@@ -439,7 +459,7 @@ def run_stock_sentiment(gc, crypto_symbol_set: Set[str]):
                 datetime.now(timezone.utc).isoformat(),
             ])
             if SENTIMENT_REQ_SLEEP_S > 0:
-                time.sleep(SENTIMENT_REQ_SLEEP_S)
+                _sleep_with_jitter(SENTIMENT_REQ_SLEEP_S)
         except Exception as e:
             logging.info(f"Stock sentiment skip {sym}: {e}")
             continue
@@ -453,10 +473,10 @@ def run_stock_sentiment(gc, crypto_symbol_set: Set[str]):
     ])
     logging.info(f"Stock sentiment complete for {len(out_rows)} symbols.")
 
-def run_crypto_sentiment(gc):
+def run_crypto_sentiment(gc) -> Set[str]:
     if not CRYPTO_SENT_ENABLED:
         logging.info("Crypto sentiment disabled (CRYPTO_SENT_ENABLED=0).")
-        return set()  # return empty crypto set
+        return set()
 
     sh = open_sheet(gc)
     ws_scraper = ensure_worksheet(sh, SCRAPER_WS, rows=10000, cols=6)
@@ -469,19 +489,39 @@ def run_crypto_sentiment(gc):
         return set()
 
     header, *rows = data
-    all_syms = [r[2].strip().upper() for r in rows if len(r) >= 3 and r[2].strip()]
-    # Map symbols → CoinGecko ids (best by market-cap rank)
-    uniq = sorted(set(all_syms))[:CRYPTO_SENT_SYMBOL_LIMIT]
-    sym_to_id = map_symbols_to_coingecko_ids(uniq)
+    # Use the combined_sources column to pick only CoinGecko-origin symbols
+    # and require symbol length >= 3 to reduce collisions.
+    candidates = []
+    for r in rows:
+        if len(r) < 3:
+            continue
+        combined_sources, symbol = r[0], r[2].strip().upper()
+        if "CoinGecko" in combined_sources and len(symbol) >= 3:
+            candidates.append(symbol)
+
+    # Unique, limited
+    crypto_syms = sorted(set(candidates))[:CRYPTO_SENT_SYMBOL_LIMIT]
+
+    # Map symbols -> CoinGecko ids (best by market-cap rank)
+    sym_to_id = map_symbols_to_coingecko_ids(crypto_syms)
 
     out_rows: List[List[str]] = []
-    crypto_syms: Set[str] = set(sym_to_id.keys())
+    identified_crypto_syms: Set[str] = set(sym_to_id.keys())
 
     for idx, (sym, cid) in enumerate(sym_to_id.items(), 1):
         if not cid:
             continue
         try:
-            data = coingecko_coin_community(cid)
+            url = f"https://api.coingecko.com/api/v3/coins/{cid}"
+            params = {
+                "localization": "false",
+                "tickers": "false",
+                "market_data": "false",
+                "community_data": "true",
+                "developer_data": "false",
+                "sparkline": "false",
+            }
+            data = fetch_json_with_retries(url, params=params)
             cd = data.get("community_data") or {}
             up = cd.get("sentiment_votes_up_percentage")
             down = cd.get("sentiment_votes_down_percentage")
@@ -489,10 +529,9 @@ def run_crypto_sentiment(gc):
             twitter_f = cd.get("twitter_followers")  # may be None / deprecated by provider
             telegram_u = cd.get("telegram_channel_user_count")
 
-            # Simple score: center on up - down; normalize to 0..100
             score = None
             if isinstance(up, (int, float)) and isinstance(down, (int, float)):
-                score = max(0.0, min(100.0, (up - down + 100.0) / 2.0))  # up=60, down=20 ⇒ (40+100)/2=70
+                score = max(0.0, min(100.0, (up - down + 100.0) / 2.0))
 
             out_rows.append([
                 sym, cid,
@@ -503,20 +542,19 @@ def run_crypto_sentiment(gc):
             ])
         except Exception as e:
             logging.info(f"Crypto sentiment skip {sym} ({cid}): {e}")
-            continue
-
-        if idx % 50 == 0:
+            # continue silently; mapping + retries should handle 429s mostly
+        # polite pacing to avoid 429s
+        if CRYPTO_REQ_SLEEP_S > 0:
+            _sleep_with_jitter(CRYPTO_REQ_SLEEP_S)
+        if idx % 40 == 0:
             logging.info(f"CoinGecko community scored {idx}/{len(sym_to_id)} crypto symbols...")
-
-        # be polite to CoinGecko
-        time.sleep(0.15)
 
     ws = ensure_worksheet(sh, CRYPTO_SENT_WS, rows=5000, cols=12)
     replace_sheet(ws, out_rows, [
         "symbol","coingecko_id","up_pct","down_pct","reddit_subs","twitter_followers","telegram_users","score","scored_at_utc"
     ])
     logging.info(f"Crypto sentiment complete for {len(out_rows)} symbols.")
-    return crypto_syms
+    return identified_crypto_syms
 
 def run_demo_write(gc):
     sh = open_sheet(gc)
