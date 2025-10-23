@@ -470,20 +470,98 @@ def score_messages(msgs: List[Dict]) -> Dict:
     }
 
 # =========================
+# Alpaca indicators + flag rules (⭐ / 🔻 / ▲)
+# =========================
+ALPACA_API_KEY_ID    = os.getenv("ALPACA_API_KEY_ID", "")
+ALPACA_API_SECRET_KEY= os.getenv("ALPACA_API_SECRET_KEY", "")
+ALPACA_DATA_BASE     = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets")
+ALPACA_FEED          = os.getenv("ALPACA_FEED", "iex")  # "iex" or "sip" (paid)
+
+SENT_POS_THRESH      = float(os.getenv("SENT_POS_THRESH", "0.05"))
+SENT_NEG_THRESH      = float(os.getenv("SENT_NEG_THRESH", "-0.05"))
+RSI_MOMO_MAX         = float(os.getenv("RSI_MOMO_MAX", "60"))
+MOMENTUM_GOOD_THRESH = float(os.getenv("MOMENTUM_GOOD_THRESH", "0.10"))
+
+def _alpaca_enabled() -> bool:
+    return bool(ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY)
+
+def get_alpaca_bars_15m(symbol: str, limit: int = 1000) -> List[float]:
+    if not _alpaca_enabled():
+        return []
+    headers = {
+        **UA,
+        "APCA-API-KEY-ID": ALPACA_API_KEY_ID,
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET_KEY,
+    }
+    url = f"{ALPACA_DATA_BASE}/v2/stocks/{symbol}/bars"
+    params = {"timeframe": "15Min", "limit": str(limit), "adjustment": "raw", "feed": ALPACA_FEED}
+    data = fetch_json_with_retries(url, params=params, headers=headers, timeout=20)
+    bars = data.get("bars", []) or []
+    closes: List[float] = []
+    for b in bars:
+        try:
+            closes.append(float(b.get("c")))
+        except Exception:
+            continue
+    return closes
+
+def sma(values: List[float], window: int) -> float:
+    if len(values) < window:
+        return float("nan")
+    return round(sum(values[-window:]) / window, 4)
+
+def rsi14(values: List[float]) -> float:
+    period = 14
+    if len(values) < period + 1:
+        return float("nan")
+    gains, losses = 0.0, 0.0
+    for i in range(-period, 0):
+        ch = values[i] - values[i-1]
+        if ch > 0:
+            gains += ch
+        else:
+            losses -= ch
+    if losses == 0:
+        return 100.0
+    rs = gains / losses
+    return round(100 - (100 / (1 + rs)), 2)
+
+def pick_flag(sent_value: float, delta: float, rsi: float, ma60: float, ma240: float) -> str:
+    """
+    Flags priority:
+      1) ⭐ if RSI<35 and MA60<MA240 (15m)
+      2) 🔻 if MA60>MA240 and sentiment <= SENT_NEG_THRESH
+      3) ▲  if MA60>MA240 and sentiment >= SENT_POS_THRESH and RSI<=RSI_MOMO_MAX and delta>=MOMENTUM_GOOD_THRESH
+      else ""
+    """
+    if any(math.isnan(x) for x in (rsi, ma60, ma240)):
+        return ""
+    if rsi < 35 and ma60 < ma240:
+        return "⭐"
+    if ma60 > ma240:
+        if sent_value <= SENT_NEG_THRESH:
+            return "🔻"
+        if sent_value >= SENT_POS_THRESH and rsi <= RSI_MOMO_MAX and delta >= MOMENTUM_GOOD_THRESH:
+            return "▲"
+    return ""
+
+# =========================
 # Formatting helper (uses GridRange)
 # =========================
 def apply_sentiment_conditional_formats(ws):
     set_frozen(ws, rows=1)
-    # Column map:
-    # A:symbol B:mean C:median D:trim_mean E:n_msgs F:pos G:neg H:neu I:delta J:source_hits K:msgs_factor L:rank M:scored_at_utc
+    # Column map (after adding flag + indicators):
+    # A:flag B:symbol C:mean D:median E:trim_mean F:n_msgs G:pos H:neg I:neu J:delta
+    # K:source_hits L:msgs_factor M:rank N:RSI14_15m O:MA60_15m P:MA240_15m Q:scored_at_utc
     format_cell_ranges(ws, [
-        ("B2:D", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
-        ("E2:E", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
-        ("F2:H", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
-        ("I2:I", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
-        ("J2:J", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
-        ("K2:K", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
-        ("L2:L", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.000"))),
+        ("C2:E", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
+        ("F2:F", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
+        ("G2:I", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
+        ("J2:J", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
+        ("K2:K", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
+        ("L2:L", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
+        ("M2:M", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.000"))),
+        ("N2:P", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
     ])
 
     red, white, green = Color(0.9, 0.2, 0.2), Color(1, 1, 1), Color(0.2, 0.7, 0.2)
@@ -501,17 +579,17 @@ def apply_sentiment_conditional_formats(ws):
     rules = get_conditional_format_rules(ws)
     rules.clear()
     # Mean/Median/Trimmed: -1 → 0 → +1
-    rules.append(rule("B2:B", -1, 0, 1))
     rules.append(rule("C2:C", -1, 0, 1))
     rules.append(rule("D2:D", -1, 0, 1))
+    rules.append(rule("E2:E", -1, 0, 1))
     # Positive ratio: greener when higher
-    rules.append(rule("F2:F", 0, 0.5, 1))
+    rules.append(rule("G2:G", 0, 0.5, 1))
     # Negative ratio: redder when higher (invert gradient)
-    rules.append(rule("G2:G", 0, 0.5, 1, invert=True))
+    rules.append(rule("H2:H", 0, 0.5, 1, invert=True))
     # Delta (bull-bear): -1 → 0 → +1
-    rules.append(rule("I2:I", -1, 0, 1))
-    # Rank: -1 → 0 → +1 (rank will generally be >=0 but keep symmetric color)
-    rules.append(rule("L2:L", -1, 0, 1))
+    rules.append(rule("J2:J", -1, 0, 1))
+    # Rank
+    rules.append(rule("M2:M", -1, 0, 1))
     rules.save()
 
 # =========================
@@ -569,10 +647,23 @@ def run_sentiment(gc):
             rank = 0.5 * coverage_term + 0.35 * sent + 0.15 * momentum
             rank = round(rank, 4)
 
+            # Indicators via Alpaca (15m)
+            rsi = ma60 = ma240 = float("nan")
+            if _alpaca_enabled():
+                closes = get_alpaca_bars_15m(s, limit=1000)
+                if closes:
+                    rsi = rsi14(closes)
+                    ma60 = sma(closes, 60)
+                    ma240 = sma(closes, 240)
+
+            # Decide leftmost flag
+            flag = pick_flag(sent, momentum, rsi, ma60, ma240)
+
             out.append([
-                s, sc["mean"], sc["median"], sc["tmean"], sc["n"],
+                flag, s, sc["mean"], sc["median"], sc["tmean"], sc["n"],
                 sc["pos"], sc["neg"], sc["neu"], sc["delta"],
                 coverage, round(msgs_factor, 4), rank,
+                rsi, ma60, ma240,
                 datetime.now(timezone.utc).isoformat()
             ])
         except Exception as e:
@@ -581,11 +672,13 @@ def run_sentiment(gc):
             logging.info(f"Processed {i}/{len(syms)}")
         _sleep_with_jitter(SENTIMENT_REQ_SLEEP_S)
 
-    ws = ensure_worksheet(sh, SENTIMENT_WS, 5000, 16)
+    # Note: new columns + flag at left; adjust column count accordingly
+    ws = ensure_worksheet(sh, SENTIMENT_WS, 5000, 18)
     replace_sheet(ws, out, [
-        "symbol","mean_comp","median_comp","trim_mean","n_msgs",
+        "flag","symbol","mean_comp","median_comp","trim_mean","n_msgs",
         "pos_ratio","neg_ratio","neu_ratio","bull_bear_delta",
-        "source_hits","msgs_factor","rank","scored_at_utc"
+        "source_hits","msgs_factor","rank",
+        "RSI14_15m","MA60_15m","MA240_15m","scored_at_utc"
     ])
 
     apply_sentiment_conditional_formats(ws)
@@ -612,7 +705,7 @@ def main():
     run_scraper(gc)
     run_sentiment(gc)
     run_demo(gc)
-    print("Done: scrape + sentiment + formatting")
+    print("Done: scrape + sentiment + indicators + flags + formatting")
 
 if __name__ == "__main__":
     main()
