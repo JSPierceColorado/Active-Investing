@@ -1,16 +1,16 @@
 import os, json, sys, time, logging, random, re, statistics
 from datetime import datetime, timezone
-from typing import List, Tuple, Dict, Optional, Set
+from typing import List, Tuple, Dict, Set
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# UPDATED: import the rules API, not set_conditional_formatting
+# Fixed imports — removed InterpolationPointType
 from gspread_formatting import (
     get_conditional_format_rules, ConditionalFormatRule, GradientRule,
-    InterpolationPoint, InterpolationPointType, Color,
+    InterpolationPoint, Color,
     format_cell_ranges, CellFormat, NumberFormat, set_frozen
 )
 
@@ -26,18 +26,18 @@ CRYPTO_SENT_WS  = os.getenv("CRYPTO_SENT_WS", "crypto_sentiment")
 HTTP_TIMEOUT    = int(os.getenv("HTTP_TIMEOUT", "15"))
 
 NASDAQ_ENABLED            = os.getenv("NASDAQ_ENABLED", "0") not in {"0", "false", "False"}
-STOCKTWITS_ENABLED       = os.getenv("STOCKTWITS_ENABLED", "1") not in {"0", "false", "False"}
-STOCKTWITS_SENTIMENT_EN  = os.getenv("STOCKTWITS_SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
+STOCKTWITS_ENABLED        = os.getenv("STOCKTWITS_ENABLED", "1") not in {"0", "false", "False"}
+STOCKTWITS_SENTIMENT_EN   = os.getenv("STOCKTWITS_SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
 
-SENTIMENT_ENABLED         = os.getenv("SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
-SENTIMENT_SYMBOL_LIMIT    = int(os.getenv("SENTIMENT_SYMBOL_LIMIT", "150"))
-SENTIMENT_MSGS_PER_SYM    = int(os.getenv("SENTIMENT_MSGS_PER_SYM", "30"))
-SENTIMENT_REQ_SLEEP_S     = float(os.getenv("SENTIMENT_REQ_SLEEP_S", "0.25"))
+SENTIMENT_ENABLED          = os.getenv("SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
+SENTIMENT_SYMBOL_LIMIT     = int(os.getenv("SENTIMENT_SYMBOL_LIMIT", "150"))
+SENTIMENT_MSGS_PER_SYM     = int(os.getenv("SENTIMENT_MSGS_PER_SYM", "30"))
+SENTIMENT_REQ_SLEEP_S      = float(os.getenv("SENTIMENT_REQ_SLEEP_S", "0.25"))
 
-CRYPTO_SENT_ENABLED       = os.getenv("CRYPTO_SENT_ENABLED", "1") not in {"0", "false", "False"}
-CRYPTO_SENT_SYMBOL_LIMIT  = int(os.getenv("CRYPTO_SENT_SYMBOL_LIMIT", "120"))
-CRYPTO_REQ_SLEEP_S        = float(os.getenv("CRYPTO_REQ_SLEEP_S", "0.35"))
-COINGECKO_IDS_BATCH       = 180
+CRYPTO_SENT_ENABLED        = os.getenv("CRYPTO_SENT_ENABLED", "1") not in {"0", "false", "False"}
+CRYPTO_SENT_SYMBOL_LIMIT   = int(os.getenv("CRYPTO_SENT_SYMBOL_LIMIT", "120"))
+CRYPTO_REQ_SLEEP_S         = float(os.getenv("CRYPTO_REQ_SLEEP_S", "0.35"))
+COINGECKO_IDS_BATCH        = 180
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -125,93 +125,70 @@ def fetch_text_with_retries(url: str, *, params=None, headers=None, timeout=HTTP
                 continue
             r.raise_for_status()
             return r.text
-        except requests.exceptions.HTTPError as e:
-            last_exc = e
-            if getattr(e.response, "status_code", None) == 429:
-                ra = e.response.headers.get("Retry-After")
-                delay = float(ra) if ra else backoff_base * (2 ** attempt)
-                logging.info(f"HTTPError 429 at {url} — sleeping {delay:.2f}s")
-                _sleep_with_jitter(delay)
-                continue
-            _sleep_with_jitter(backoff_base * (2 ** attempt))
         except Exception as e:
             last_exc = e
             _sleep_with_jitter(backoff_base * (2 ** attempt))
     raise last_exc
 
 # =========================
-# Fetchers: Yahoo / Nasdaq / CoinGecko / Stocktwits (same as before)
+# Fetchers: Yahoo / Nasdaq / CoinGecko / Stocktwits
 # =========================
-def _yahoo_predefined(scr_id: str, count: int = 100) -> List[str]:
-    url = "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
-    params = {"scrIds": scr_id, "count": str(count), "lang": "en-US", "region": "US"}
-    data = fetch_json_with_retries(url, params=params)
-    out: List[str] = []
-    for res in data.get("finance", {}).get("result", []):
-        for item in res.get("quotes", []):
-            sym = (item.get("symbol") or "").strip().upper()
-            if sym: out.append(sym)
-    return out
-
 def get_yahoo_trending_stocks() -> List[str]:
     data = fetch_json_with_retries("https://query1.finance.yahoo.com/v1/finance/trending/US")
-    out: List[str] = []
+    out = []
     for result in data.get("finance", {}).get("result", []):
         for item in result.get("quotes", []):
             sym = (item.get("symbol") or "").strip().upper()
-            if sym: out.append(sym)
+            if sym:
+                out.append(sym)
     return out
 
 def get_yahoo_most_active() -> List[str]:
-    return _yahoo_predefined("most_actives", 100)
-
-def get_nasdaq_most_active() -> List[str]:
-    if not NASDAQ_ENABLED: return []
-    url = "https://api.nasdaq.com/api/quote/list-type/mostactive"
-    headers = {**UA, "Accept": "application/json, text/plain, */*", "Origin": "https://www.nasdaq.com",
-               "Referer": "https://www.nasdaq.com/market-activity/most-active"}
-    params = {"assetclass": "stocks"}
-    data = fetch_json_with_retries(url, params=params, headers=headers, timeout=25)
-    items = (data.get("data") or {}).get("data") or []
-    return [(row.get("symbol") or "").strip().upper() for row in items if row.get("symbol")]
+    url = "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
+    params = {"scrIds": "most_actives", "count": "100", "lang": "en-US", "region": "US"}
+    data = fetch_json_with_retries(url, params=params)
+    out = []
+    for res in data.get("finance", {}).get("result", []):
+        for item in res.get("quotes", []):
+            sym = (item.get("symbol") or "").strip().upper()
+            if sym:
+                out.append(sym)
+    return out
 
 def get_coingecko_trending() -> List[str]:
     data = fetch_json_with_retries("https://api.coingecko.com/api/v3/search/trending")
     out = []
     for it in data.get("coins", []):
         sym = ((it.get("item") or {}).get("symbol") or "").strip().upper()
-        if sym: out.append(sym)
+        if sym:
+            out.append(sym)
     return out
 
 def get_coingecko_top_by_volume(limit: int = 50) -> List[str]:
-    data = fetch_json_with_retries("https://api.coingecko.com/api/v3/coins/markets",
-                                   params={"vs_currency": "usd", "order": "volume_desc", "per_page": str(limit), "page": "1"})
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {"vs_currency": "usd", "order": "volume_desc", "per_page": str(limit), "page": "1"}
+    data = fetch_json_with_retries(url, params=params)
     return [(coin.get("symbol") or "").strip().upper() for coin in data]
 
-def get_stocktwits_trending_api() -> List[str]:
-    if not STOCKTWITS_ENABLED: return []
-    data = fetch_json_with_retries("https://api.stocktwits.com/api/2/trending/symbols.json",
-                                   headers={**UA, "Accept": "application/json, text/plain, */*",
-                                            "Origin": "https://stocktwits.com", "Referer": "https://stocktwits.com/"})
-    return [(item.get("symbol") or "").strip().upper() for item in (data.get("symbols") or [])]
-
+# =========================
+# Stocktwits
+# =========================
 _STW_SENTIMENT_MAP = {
     "Stocktwits - Sentiment Trending":     "https://stocktwits.com/sentiment",
     "Stocktwits - Sentiment Most Active":  "https://stocktwits.com/sentiment/most-active",
     "Stocktwits - Sentiment Watchers":     "https://stocktwits.com/sentiment/watchers",
     "Stocktwits - Sentiment Most Bullish": "https://stocktwits.com/sentiment/most-bullish",
     "Stocktwits - Sentiment Most Bearish": "https://stocktwits.com/sentiment/most-bearish",
-    "Stocktwits - Sentiment Top Gainers":  "https://stocktwits.com/sentiment/top-gainers",
-    "Stocktwits - Sentiment Top Losers":   "https://stocktwits.com/sentiment/top-losers",
 }
 _SYMBOL_RE = re.compile(r"/symbol/([A-Za-z0-9\.\-_]+)")
 
 def _parse_symbols_from_html(html: str) -> List[str]:
     raw = {m.group(1).upper() for m in _SYMBOL_RE.finditer(html)}
-    return [s for s in sorted(raw) if 1 <= len(s) <= 12 and not s.startswith("-") and not s.endswith("-")]
+    return [s for s in sorted(raw) if 1 <= len(s) <= 12]
 
 def get_stocktwits_sentiment_sets() -> List[Tuple[str, List[str]]]:
-    if not STOCKTWITS_SENTIMENT_EN: return []
+    if not STOCKTWITS_SENTIMENT_EN:
+        return []
     sources = []
     headers = {**UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
     for name, url in _STW_SENTIMENT_MAP.items():
@@ -221,18 +198,18 @@ def get_stocktwits_sentiment_sets() -> List[Tuple[str, List[str]]]:
             logging.info(f"{name}: scraped {len(syms)} symbols.")
             sources.append((name, syms))
         except Exception as e:
-            logging.info(f"{name}: skipped due to error: {e}")
+            logging.info(f"{name}: skipped ({e})")
     return sources
 
 def fetch_stocktwits_messages(symbol: str, limit: int) -> List[Dict]:
     url = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
-    headers = {**UA, "Accept": "application/json, text/plain, */*",
-               "Origin": "https://stocktwits.com", "Referer": f"https://stocktwits.com/symbol/{symbol}"}
-    data = fetch_json_with_retries(url, headers=headers, params={"limit": str(limit)}, timeout=15)
+    headers = {**UA, "Accept": "application/json, text/plain, */*"}
+    params = {"limit": str(limit)}
+    data = fetch_json_with_retries(url, headers=headers, params=params, timeout=15)
     return data.get("messages", []) or []
 
 # =========================
-# Scrape orchestration
+# Scraper orchestration
 # =========================
 def collect_sources() -> List[Tuple[str, List[str]]]:
     sources = []
@@ -242,224 +219,56 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
             logging.info(f"{name}: fetched {len(syms)} symbols.")
             sources.append((name, syms))
         except Exception as e:
-            logging.info(f"{name}: skipped due to error: {e}")
-    # Yahoo
+            logging.info(f"{name}: skipped ({e})")
+
     try_add("Yahoo Finance - Trending (US)", get_yahoo_trending_stocks)
-    try_add("Yahoo Finance - Most Active",  get_yahoo_most_active)
-    # Nasdaq (optional)
-    try_add("Nasdaq - Most Active",         get_nasdaq_most_active)
-    # CoinGecko
-    try_add("CoinGecko - Trending",         get_coingecko_trending)
-    try_add("CoinGecko - Top by Volume",    get_coingecko_top_by_volume)
-    # Stocktwits
-    try_add("Stocktwits - Trending (API)",  get_stocktwits_trending_api)
+    try_add("Yahoo Finance - Most Active", get_yahoo_most_active)
+    try_add("CoinGecko - Trending", get_coingecko_trending)
+    try_add("CoinGecko - Top by Volume", get_coingecko_top_by_volume)
     for name, syms in get_stocktwits_sentiment_sets():
         sources.append((name, syms))
     return sources
 
 def combine_sources_to_rows(sources: List[Tuple[str, List[str]]]) -> List[List[str]]:
     ts = datetime.now(timezone.utc).isoformat()
-    symbol_to_sources: Dict[str, Set[str]] = {}
-    for source, symbols in sources:
-        for sym in symbols:
-            s = sym.strip().upper()
-            if not s: continue
-            symbol_to_sources.setdefault(s, set()).add(source)
-    rows = []
-    for symbol in sorted(symbol_to_sources):
-        combined_source = ", ".join(sorted(symbol_to_sources[symbol]))
-        rows.append([combined_source, ts, symbol])
-    return rows
+    sym_to_src = {}
+    for src, syms in sources:
+        for s in syms:
+            sym_to_src.setdefault(s, set()).add(src)
+    return [[", ".join(sorted(v)), ts, k] for k, v in sorted(sym_to_src.items())]
 
 # =========================
-# STOCK sentiment (VADER)
+# Sentiment analysis (stocks)
 # =========================
 _analyzer = SentimentIntensityAnalyzer()
 
-def score_messages(messages: List[Dict]) -> Dict:
-    scores, last_ts = [], None
-    pos = neg = neu = 0
-    for m in messages:
-        body = (m.get("body") or "").strip()
-        if not body: continue
-        c = _analyzer.polarity_scores(body)["compound"]
+def score_messages(msgs: List[Dict]) -> Dict:
+    scores, pos, neg, neu = [], 0, 0, 0
+    for m in msgs:
+        text = (m.get("body") or "").strip()
+        if not text:
+            continue
+        c = _analyzer.polarity_scores(text)["compound"]
         scores.append(c)
         if c >= 0.05: pos += 1
         elif c <= -0.05: neg += 1
         else: neu += 1
-        created = m.get("created_at")
-        if created: last_ts = created
-    n = len(scores)
-    if n == 0:
-        return {"n_msgs": 0, "mean": 0.0, "median": 0.0, "pos_ratio": 0.0, "neg_ratio": 0.0, "neu_ratio": 0.0, "last_message_at": last_ts or ""}
-    mean = sum(scores)/n
-    median = statistics.median(scores)
-    return {"n_msgs": n, "mean": round(mean,4), "median": round(median,4),
-            "pos_ratio": round(pos/n,4), "neg_ratio": round(neg/n,4), "neu_ratio": round(neu/n,4),
-            "last_message_at": last_ts or ""}
+    if not scores:
+        return {"mean": 0, "median": 0, "n": 0, "pos": 0, "neg": 0, "neu": 0}
+    return {
+        "mean": round(sum(scores)/len(scores), 4),
+        "median": round(statistics.median(scores), 4),
+        "n": len(scores),
+        "pos": round(pos/len(scores), 4),
+        "neg": round(neg/len(scores), 4),
+        "neu": round(neu/len(scores), 4),
+    }
 
 # =========================
-# CRYPTO sentiment (CoinGecko community)
-# =========================
-def coingecko_all_coins_list() -> List[Dict]:
-    return fetch_json_with_retries("https://api.coingecko.com/api/v3/coins/list")
-
-def coingecko_markets_for_ids(ids: List[str]) -> Dict[str, Dict]:
-    out: Dict[str, Dict] = {}
-    if not ids: return out
-    for i in range(0, len(ids), COINGECKO_IDS_BATCH):
-        chunk = ids[i:i+COINGECKO_IDS_BATCH]
-        data = fetch_json_with_retries("https://api.coingecko.com/api/v3/coins/markets",
-                                       params={"vs_currency": "usd", "ids": ",".join(chunk), "per_page": "250", "page": "1"})
-        for row in data:
-            out[row.get("id")] = {"market_cap_rank": row.get("market_cap_rank")}
-        _sleep_with_jitter(0.2)
-    return out
-
-def map_symbols_to_coingecko_ids(symbols: List[str]) -> Dict[str, str]:
-    symbols = [s for s in symbols if s and len(s) >= 3]
-    all_coins = coingecko_all_coins_list()
-    sym_to_ids: Dict[str, List[str]] = {}
-    for c in all_coins:
-        sym = (c.get("symbol") or "").upper()
-        cid = c.get("id")
-        if not sym or not cid: continue
-        sym_to_ids.setdefault(sym, []).append(cid)
-    candidates = {s: sym_to_ids.get(s, []) for s in symbols}
-    all_ids = sorted({cid for ids in candidates.values() for cid in ids})
-    ranks = coingecko_markets_for_ids(all_ids)
-    sym_best: Dict[str, str] = {}
-    for s, ids in candidates.items():
-        if not ids: continue
-        best, best_rank = None, 10**9
-        for cid in ids:
-            r = ranks.get(cid, {}).get("market_cap_rank")
-            if isinstance(r, int) and r > 0 and r < best_rank:
-                best, best_rank = cid, r
-        sym_best[s] = best if best else ids[0]
-    return sym_best
-
-# =========================
-# Runners
-# =========================
-def run_scraper(gc):
-    sh = open_sheet(gc)
-    ws = ensure_worksheet(sh, SCRAPER_WS, rows=10000, cols=6)
-    rows = combine_sources_to_rows(collect_sources())
-    replace_sheet(ws, rows, ["source", "date_utc", "symbol"])
-
-def run_stock_sentiment(gc, crypto_symbol_set: Set[str]):
-    if not SENTIMENT_ENABLED:
-        logging.info("Stock sentiment disabled.")
-        return
-    sh = open_sheet(gc)
-    ws_scraper = ensure_worksheet(sh, SCRAPER_WS, rows=10000, cols=6)
-    data = ws_scraper.get_all_values()
-    if len(data) <= 1:
-        logging.info("No symbols; skipping stock sentiment.")
-        replace_sheet(ensure_worksheet(sh, SENTIMENT_WS, rows=2000, cols=12), [], [
-            "symbol","mean_compound","median_compound","n_msgs","pos_ratio","neg_ratio","neu_ratio","last_message_at","scored_at_utc"
-        ])
-        return
-    header, *rows = data
-    all_syms = [(r[0], r[2].strip().upper()) for r in rows if len(r) >= 3 and r[2].strip()]
-    stock_syms = sorted({sym for srcs, sym in all_syms if sym not in crypto_symbol_set})[:SENTIMENT_SYMBOL_LIMIT]
-
-    out_rows: List[List[str]] = []
-    for i, sym in enumerate(stock_syms, 1):
-        try:
-            msgs = fetch_stocktwits_messages(sym, limit=SENTIMENT_MSGS_PER_SYM)
-            stats = score_messages(msgs)
-            out_rows.append([sym, stats["mean"], stats["median"], stats["n_msgs"],
-                             stats["pos_ratio"], stats["neg_ratio"], stats["neu_ratio"],
-                             stats["last_message_at"], datetime.now(timezone.utc).isoformat()])
-            if SENTIMENT_REQ_SLEEP_S > 0:
-                _sleep_with_jitter(SENTIMENT_REQ_SLEEP_S)
-        except Exception as e:
-            logging.info(f"Stock sentiment skip {sym}: {e}")
-        if i % 25 == 0:
-            logging.info(f"VADER scored {i}/{len(stock_syms)} stock symbols...")
-
-    ws_sent = ensure_worksheet(sh, SENTIMENT_WS, rows=5000, cols=12)
-    replace_sheet(ws_sent, out_rows, [
-        "symbol","mean_compound","median_compound","n_msgs",
-        "pos_ratio","neg_ratio","neu_ratio","last_message_at","scored_at_utc"
-    ])
-    apply_sentiment_conditional_formats(ws_sent)
-
-def run_crypto_sentiment(gc) -> Set[str]:
-    if not CRYPTO_SENT_ENABLED:
-        logging.info("Crypto sentiment disabled.")
-        return set()
-    sh = open_sheet(gc)
-    ws_scraper = ensure_worksheet(sh, SCRAPER_WS, rows=10000, cols=6)
-    data = ws_scraper.get_all_values()
-    if len(data) <= 1:
-        replace_sheet(ensure_worksheet(sh, CRYPTO_SENT_WS, rows=2000, cols=12), [], [
-            "symbol","coingecko_id","up_pct","down_pct","reddit_subs","twitter_followers","telegram_users","score","scored_at_utc"
-        ])
-        return set()
-
-    header, *rows = data
-    candidates = []
-    for r in rows:
-        if len(r) < 3: continue
-        combined_sources, symbol = r[0], r[2].strip().upper()
-        if "CoinGecko" in combined_sources and len(symbol) >= 3:
-            candidates.append(symbol)
-
-    crypto_syms = sorted(set(candidates))[:CRYPTO_SENT_SYMBOL_LIMIT]
-    sym_to_id = map_symbols_to_coingecko_ids(crypto_syms)
-
-    out_rows: List[List[str]] = []
-    identified_crypto_syms: Set[str] = set(sym_to_id.keys())
-
-    for idx, (sym, cid) in enumerate(sym_to_id.items(), 1):
-        if not cid: continue
-        try:
-            data = fetch_json_with_retries(
-                f"https://api.coingecko.com/api/v3/coins/{cid}",
-                params={"localization":"false","tickers":"false","market_data":"false",
-                        "community_data":"true","developer_data":"false","sparkline":"false"}
-            )
-            cd = data.get("community_data") or {}
-            up = cd.get("sentiment_votes_up_percentage")
-            down = cd.get("sentiment_votes_down_percentage")
-            reddit_subs = cd.get("reddit_subscribers")
-            twitter_f = cd.get("twitter_followers")
-            telegram_u = cd.get("telegram_channel_user_count")
-            score = None
-            if isinstance(up,(int,float)) and isinstance(down,(int,float)):
-                score = max(0.0, min(100.0, (up - down + 100.0)/2.0))
-            out_rows.append([sym, cid, round(up or 0.0,2), round(down or 0.0,2),
-                             int(reddit_subs or 0), int(twitter_f or 0), int(telegram_u or 0),
-                             round(score or 0.0,2), datetime.now(timezone.utc).isoformat()])
-        except Exception as e:
-            logging.info(f"Crypto sentiment skip {sym} ({cid}): {e}")
-        if CRYPTO_REQ_SLEEP_S > 0:
-            _sleep_with_jitter(CRYPTO_REQ_SLEEP_S)
-        if idx % 40 == 0:
-            logging.info(f"CoinGecko community scored {idx}/{len(sym_to_id)} crypto symbols...")
-
-    ws = ensure_worksheet(sh, CRYPTO_SENT_WS, rows=5000, cols=12)
-    replace_sheet(ws, out_rows, [
-        "symbol","coingecko_id","up_pct","down_pct","reddit_subs","twitter_followers","telegram_users","score","scored_at_utc"
-    ])
-    return identified_crypto_syms
-
-def run_demo_write(gc):
-    sh = open_sheet(gc)
-    ws = ensure_worksheet(sh, WORKSHEET, rows=200, cols=10)
-    ts = datetime.now(timezone.utc).isoformat()
-    ws.append_row(["Deployed on Railway 🎉", ts], value_input_option="RAW")
-
-# =========================
-# Conditional formatting for sentiment tab (using rules.save())
+# Formatting helper
 # =========================
 def apply_sentiment_conditional_formats(ws):
     set_frozen(ws, rows=1)
-
-    # Number formats
     format_cell_ranges(ws, [
         ("B2:B", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
         ("C2:C", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
@@ -467,42 +276,68 @@ def apply_sentiment_conditional_formats(ws):
         ("F2:F", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
         ("G2:G", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
     ])
+    red, white, green = Color(0.9,0.2,0.2), Color(1,1,1), Color(0.2,0.7,0.2)
 
-    red   = Color(0.90, 0.20, 0.20)
-    white = Color(1, 1, 1)
-    green = Color(0.20, 0.70, 0.20)
-
-    def three_color_rule(a1_range: str, min_num: float, mid_num: float, max_num: float, invert=False):
+    def rule(range_, min_, mid_, max_, invert=False):
         return ConditionalFormatRule(
-            ranges=[a1_range],
+            ranges=[range_],
             gradientRule=GradientRule(
-                minpoint=InterpolationPoint(type=InterpolationPointType.NUMBER, value=str(min_num), color=(green if invert else red)),
-                midpoint=InterpolationPoint(type=InterpolationPointType.NUMBER, value=str(mid_num),  color=white),
-                maxpoint=InterpolationPoint(type=InterpolationPointType.NUMBER, value=str(max_num), color=(red if invert else green)),
+                minpoint=InterpolationPoint(type="NUMBER", value=str(min_), color=(green if invert else red)),
+                midpoint=InterpolationPoint(type="NUMBER", value=str(mid_), color=white),
+                maxpoint=InterpolationPoint(type="NUMBER", value=str(max_), color=(red if invert else green)),
             )
         )
-
     rules = get_conditional_format_rules(ws)
-    rules.clear()  # wipe old rules
-    # Mean/Median compound: -1 → 0 → +1
-    rules.append(three_color_rule("B2:B", -1, 0, 1, invert=False))
-    rules.append(three_color_rule("C2:C", -1, 0, 1, invert=False))
-    # Positive ratio: 0 → 0.5 → 1 (green up)
-    rules.append(three_color_rule("E2:E", 0, 0.5, 1, invert=False))
-    # Negative ratio: 0 → 0.5 → 1 (red up)
-    rules.append(three_color_rule("F2:F", 0, 0.5, 1, invert=True))
+    rules.clear()
+    rules.append(rule("B2:B", -1, 0, 1))
+    rules.append(rule("C2:C", -1, 0, 1))
+    rules.append(rule("E2:E", 0, 0.5, 1))
+    rules.append(rule("F2:F", 0, 0.5, 1, invert=True))
     rules.save()
 
 # =========================
-# Entry point
+# Main pipeline
 # =========================
+def run_scraper(gc):
+    sh = open_sheet(gc)
+    ws = ensure_worksheet(sh, SCRAPER_WS, 10000, 6)
+    data = combine_sources_to_rows(collect_sources())
+    replace_sheet(ws, data, ["source","date_utc","symbol"])
+
+def run_sentiment(gc):
+    sh = open_sheet(gc)
+    ws_scraper = ensure_worksheet(sh, SCRAPER_WS)
+    data = ws_scraper.get_all_values()
+    if len(data) <= 1:
+        return
+    _, *rows = data
+    syms = sorted({r[2].strip().upper() for r in rows if len(r) >= 3})[:SENTIMENT_SYMBOL_LIMIT]
+    out = []
+    for i, s in enumerate(syms, 1):
+        try:
+            msgs = fetch_stocktwits_messages(s, SENTIMENT_MSGS_PER_SYM)
+            sc = score_messages(msgs)
+            out.append([s, sc["mean"], sc["median"], sc["n"], sc["pos"], sc["neg"], sc["neu"], datetime.now(timezone.utc).isoformat()])
+        except Exception as e:
+            logging.info(f"{s} sentiment skip: {e}")
+        if i % 25 == 0:
+            logging.info(f"Processed {i}/{len(syms)}")
+        _sleep_with_jitter(SENTIMENT_REQ_SLEEP_S)
+    ws = ensure_worksheet(sh, SENTIMENT_WS, 5000, 10)
+    replace_sheet(ws, out, ["symbol","mean_compound","median_compound","n_msgs","pos_ratio","neg_ratio","neu_ratio","scored_at_utc"])
+    apply_sentiment_conditional_formats(ws)
+
+def run_demo(gc):
+    sh = open_sheet(gc)
+    ws = ensure_worksheet(sh, WORKSHEET)
+    ws.append_row(["Deployed OK", datetime.now(timezone.utc).isoformat()], value_input_option="RAW")
+
 def main():
     gc = get_client()
     run_scraper(gc)
-    crypto_syms = run_crypto_sentiment(gc)
-    run_stock_sentiment(gc, crypto_symbol_set=crypto_syms)
-    run_demo_write(gc)
-    print("Scrape + Sentiment + Formatting complete and demo row written.")
+    run_sentiment(gc)
+    run_demo(gc)
+    print("Done: scrape + sentiment + formatting")
 
 if __name__ == "__main__":
     main()
