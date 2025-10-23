@@ -7,10 +7,10 @@ import gspread
 from google.oauth2.service_account import Credentials
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# Fixed imports — removed InterpolationPointType
+# ✅ Use GridRange + string "NUMBER" types (compatible with older gspread-formatting)
 from gspread_formatting import (
     get_conditional_format_rules, ConditionalFormatRule, GradientRule,
-    InterpolationPoint, Color,
+    InterpolationPoint, Color, GridRange,
     format_cell_ranges, CellFormat, NumberFormat, set_frozen
 )
 
@@ -131,7 +131,7 @@ def fetch_text_with_retries(url: str, *, params=None, headers=None, timeout=HTTP
     raise last_exc
 
 # =========================
-# Fetchers: Yahoo / Nasdaq / CoinGecko / Stocktwits
+# Fetchers: Yahoo / CoinGecko / Stocktwits
 # =========================
 def get_yahoo_trending_stocks() -> List[str]:
     data = fetch_json_with_retries("https://query1.finance.yahoo.com/v1/finance/trending/US")
@@ -265,7 +265,7 @@ def score_messages(msgs: List[Dict]) -> Dict:
     }
 
 # =========================
-# Formatting helper
+# Formatting helper (uses GridRange)
 # =========================
 def apply_sentiment_conditional_formats(ws):
     set_frozen(ws, rows=1)
@@ -276,22 +276,27 @@ def apply_sentiment_conditional_formats(ws):
         ("F2:F", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
         ("G2:G", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
     ])
-    red, white, green = Color(0.9,0.2,0.2), Color(1,1,1), Color(0.2,0.7,0.2)
 
-    def rule(range_, min_, mid_, max_, invert=False):
+    red, white, green = Color(0.9, 0.2, 0.2), Color(1, 1, 1), Color(0.2, 0.7, 0.2)
+
+    def rule(a1_range: str, min_, mid_, max_, invert=False):
         return ConditionalFormatRule(
-            ranges=[range_],
+            ranges=[GridRange.from_a1_range(a1_range, ws)],
             gradientRule=GradientRule(
                 minpoint=InterpolationPoint(type="NUMBER", value=str(min_), color=(green if invert else red)),
                 midpoint=InterpolationPoint(type="NUMBER", value=str(mid_), color=white),
                 maxpoint=InterpolationPoint(type="NUMBER", value=str(max_), color=(red if invert else green)),
             )
         )
+
     rules = get_conditional_format_rules(ws)
     rules.clear()
+    # Mean/Median: -1 → 0 → +1
     rules.append(rule("B2:B", -1, 0, 1))
     rules.append(rule("C2:C", -1, 0, 1))
+    # Positive ratio: greener when higher
     rules.append(rule("E2:E", 0, 0.5, 1))
+    # Negative ratio: redder when higher (invert gradient)
     rules.append(rule("F2:F", 0, 0.5, 1, invert=True))
     rules.save()
 
