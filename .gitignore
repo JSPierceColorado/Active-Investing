@@ -1,0 +1,4 @@
+# never commit creds
+*.json
+.env
+__pycache__/
