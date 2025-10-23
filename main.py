@@ -35,6 +35,16 @@ SENTIMENT_SYMBOL_LIMIT     = int(os.getenv("SENTIMENT_SYMBOL_LIMIT", "150"))
 SENTIMENT_MSGS_PER_SYM     = int(os.getenv("SENTIMENT_MSGS_PER_SYM", "30"))
 SENTIMENT_REQ_SLEEP_S      = float(os.getenv("SENTIMENT_REQ_SLEEP_S", "0.25"))
 
+# --- New: Reddit / Google Finance toggles (default DISABLED so you don't need envs) ---
+REDDIT_ENABLED            = os.getenv("REDDIT_ENABLED", "0") not in {"0", "false", "False"}
+REDDIT_SUBREDDITS         = os.getenv("REDDIT_SUBREDDITS", "wallstreetbets,stocks,finance").split(",")
+REDDIT_SORT               = os.getenv("REDDIT_SORT", "hot")  # hot|new|top|rising
+REDDIT_LIMIT              = int(os.getenv("REDDIT_LIMIT", "150"))  # per subreddit
+REDDIT_TIME_FILTER        = os.getenv("REDDIT_TIME_FILTER", "day")  # hour|day|week|month|year|all
+
+GOOGLE_FINANCE_ENABLED    = os.getenv("GOOGLE_FINANCE_ENABLED", "0") not in {"0", "false", "False"}
+GOOGLE_FINANCE_PAGES      = os.getenv("GOOGLE_FINANCE_PAGES", "most-active,gainers,losers").split(",")
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -190,8 +200,105 @@ def fetch_stocktwits_messages(symbol: str, limit: int) -> List[Dict]:
     return data.get("messages", []) or []
 
 # =========================
+# NEW: Lightweight ticker extraction for arbitrary text
+# =========================
+_TICKER_RE = re.compile(r"\b[A-Z][A-Z0-9\.]{1,4}\b")  # 2–5 chars, allow '.' like BRK.B
+_TICKER_BLACKLIST = {
+    "A", "I", "DD", "CEO", "CFO", "CTO", "IMO", "TLDR", "USA", "USD", "ETF", "EPS",
+    "GDP", "FOMO", "YOLO", "ATH", "AI", "EV", "OTC", "IPO", "P/E", "WSB", "FED",
+    "CPI", "PPI", "MOM", "YOY", "PE", "ROI", "RSI", "MACD"
+}
+
+def _extract_tickers(text: str) -> List[str]:
+    if not text:
+        return []
+    cands = {m.group(0).upper() for m in _TICKER_RE.finditer(text)}
+    return [c for c in cands if c not in _TICKER_BLACKLIST and 1 < len(c) <= 5]
+
+# =========================
+# NEW: Reddit fetchers (r/wallstreetbets, r/finance, etc.)
+# =========================
+
+def _reddit_listing_url(sub: str, sort: str, limit: int, t: str) -> str:
+    # e.g. https://www.reddit.com/r/wallstreetbets/hot.json?limit=100&t=day
+    sort = sort.lower()
+    base = f"https://www.reddit.com/r/{sub}/{sort}.json"
+    params = {"limit": str(min(limit, 100))}
+    if sort == "top":
+        params["t"] = t
+    return base + "?" + "&".join([f"{k}={v}" for k, v in params.items()])
+
+def get_reddit_symbols_from_subreddit(subreddit: str, *, sort: str, limit: int, t: str) -> List[str]:
+    url = _reddit_listing_url(subreddit, sort, limit, t)
+    headers = {**UA, "Accept": "application/json"}
+    data = fetch_json_with_retries(url, headers=headers, timeout=15)
+    children = (data.get("data", {}) or {}).get("children", []) or []
+    found: set = set()
+    for ch in children:
+        post = (ch.get("data") or {})
+        title = post.get("title") or ""
+        selftext = post.get("selftext") or ""
+        for part in (title, selftext):
+            for sym in _extract_tickers(part):
+                found.add(sym)
+    return sorted(found)
+
+def get_reddit_symbols() -> List[str]:
+    if not REDDIT_ENABLED:
+        return []
+    all_syms: set = set()
+    for sub in [s.strip() for s in REDDIT_SUBREDDITS if s.strip()]:
+        try:
+            syms = get_reddit_symbols_from_subreddit(
+                sub, sort=REDDIT_SORT, limit=REDDIT_LIMIT, t=REDDIT_TIME_FILTER
+            )
+            logging.info(f"Reddit r/{sub}: extracted {len(syms)} symbols.")
+            all_syms.update(syms)
+            _sleep_with_jitter(0.6)  # be nice to Reddit
+        except Exception as e:
+            logging.info(f"Reddit r/{sub}: skipped ({e})")
+    return sorted(all_syms)
+
+# =========================
+# NEW: Google Finance markets pages
+# =========================
+_GOOG_FIN_BASE = "https://www.google.com/finance/markets/"
+_GOOG_PAGES_MAP = {
+    "most-active": "most-active",
+    "gainers": "gainers",
+    "losers": "losers",
+}
+# e.g. /finance/quote/TSLA:NASDAQ
+_GOOG_TICKER_HREF_RE = re.compile(r"/finance/quote/([A-Z][A-Z0-9\.-]{0,11}):")
+
+def get_google_finance_page_symbols(page_key: str) -> List[str]:
+    path = _GOOG_PAGES_MAP.get(page_key.strip().lower())
+    if not path:
+        return []
+    url = _GOOG_FIN_BASE + path
+    html = fetch_text_with_retries(url, headers=UA, timeout=20)
+    syms = {m.group(1).upper() for m in _GOOG_TICKER_HREF_RE.finditer(html)}
+    syms = {s for s in syms if 1 <= len(s) <= 12}
+    return sorted(syms)
+
+def get_google_finance_symbols() -> List[Tuple[str, List[str]]]:
+    if not GOOGLE_FINANCE_ENABLED:
+        return []
+    out: List[Tuple[str, List[str]]] = []
+    for key in [k.strip() for k in GOOGLE_FINANCE_PAGES if k.strip()]:
+        try:
+            syms = get_google_finance_page_symbols(key)
+            logging.info(f"Google Finance - {key}: scraped {len(syms)} symbols.")
+            out.append((f"Google Finance - {key.title()}", syms))
+            _sleep_with_jitter(0.4)
+        except Exception as e:
+            logging.info(f"Google Finance - {key}: skipped ({e})")
+    return out
+
+# =========================
 # Scraper orchestration
 # =========================
+
 def collect_sources() -> List[Tuple[str, List[str]]]:
     sources: List[Tuple[str, List[str]]] = []
 
@@ -207,10 +314,25 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
     try_add("Yahoo Finance - Trending (US)", get_yahoo_trending_stocks)
     try_add("Yahoo Finance - Most Active", get_yahoo_most_active)
 
+    # New: Google Finance (multiple pages)
+    if GOOGLE_FINANCE_ENABLED:
+        for name, syms in get_google_finance_symbols():
+            sources.append((name, syms))
+
     # Stocktwits sentiment lists (symbols only; scoring happens later)
     for name, syms in get_stocktwits_sentiment_sets():
         sources.append((name, syms))
+
+    # New: Reddit (aggregate across subs)
+    if REDDIT_ENABLED:
+        try:
+            r_syms = get_reddit_symbols()
+            sources.append((f"Reddit ({','.join(REDDIT_SUBREDDITS)})[{REDDIT_SORT}/{REDDIT_TIME_FILTER}]", r_syms))
+        except Exception as e:
+            logging.info(f"Reddit aggregate: skipped ({e})")
+
     return sources
+
 
 def combine_sources_to_rows(sources: List[Tuple[str, List[str]]]) -> List[List[str]]:
     ts = datetime.now(timezone.utc).isoformat()
@@ -250,6 +372,7 @@ def score_messages(msgs: List[Dict]) -> Dict:
 # =========================
 # Formatting helper (uses GridRange)
 # =========================
+
 def apply_sentiment_conditional_formats(ws):
     set_frozen(ws, rows=1)
     format_cell_ranges(ws, [
@@ -286,6 +409,7 @@ def apply_sentiment_conditional_formats(ws):
 # =========================
 # Main pipeline
 # =========================
+
 def run_scraper(gc):
     sh = open_sheet(gc)
     ws = ensure_worksheet(sh, SCRAPER_WS, 10000, 6)
