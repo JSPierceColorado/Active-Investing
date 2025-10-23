@@ -35,7 +35,7 @@ SENTIMENT_SYMBOL_LIMIT     = int(os.getenv("SENTIMENT_SYMBOL_LIMIT", "150"))
 SENTIMENT_MSGS_PER_SYM     = int(os.getenv("SENTIMENT_MSGS_PER_SYM", "30"))
 SENTIMENT_REQ_SLEEP_S      = float(os.getenv("SENTIMENT_REQ_SLEEP_S", "0.25"))
 
-# --- New: Reddit / Google Finance toggles (default DISABLED so you don't need envs) ---
+# --- Reddit / Google Finance toggles: default DISABLED so you don't need envs yet ---
 REDDIT_ENABLED            = os.getenv("REDDIT_ENABLED", "0") not in {"0", "false", "False"}
 REDDIT_SUBREDDITS         = os.getenv("REDDIT_SUBREDDITS", "wallstreetbets,stocks,finance").split(",")
 REDDIT_SORT               = os.getenv("REDDIT_SORT", "hot")  # hot|new|top|rising
@@ -43,7 +43,8 @@ REDDIT_LIMIT              = int(os.getenv("REDDIT_LIMIT", "150"))  # per subredd
 REDDIT_TIME_FILTER        = os.getenv("REDDIT_TIME_FILTER", "day")  # hour|day|week|month|year|all
 
 GOOGLE_FINANCE_ENABLED    = os.getenv("GOOGLE_FINANCE_ENABLED", "0") not in {"0", "false", "False"}
-GOOGLE_FINANCE_PAGES      = os.getenv("GOOGLE_FINANCE_PAGES", "most-active,gainers,losers").split(",")
+# Only most-active by default (no gainers/losers wired in)
+GOOGLE_FINANCE_PAGES      = os.getenv("GOOGLE_FINANCE_PAGES", "most-active").split(",")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -162,7 +163,7 @@ def get_yahoo_most_active() -> List[str]:
     return out
 
 # =========================
-# Stocktwits
+# Stocktwits (lists + messages)
 # =========================
 _STW_SENTIMENT_MAP = {
     "Stocktwits - Sentiment Trending":     "https://stocktwits.com/sentiment",
@@ -218,7 +219,6 @@ def _extract_tickers(text: str) -> List[str]:
 # =========================
 # NEW: Reddit fetchers (r/wallstreetbets, r/finance, etc.)
 # =========================
-
 def _reddit_listing_url(sub: str, sort: str, limit: int, t: str) -> str:
     # e.g. https://www.reddit.com/r/wallstreetbets/hot.json?limit=100&t=day
     sort = sort.lower()
@@ -260,24 +260,32 @@ def get_reddit_symbols() -> List[str]:
     return sorted(all_syms)
 
 # =========================
-# NEW: Google Finance markets pages
+# NEW: Google Finance markets (most-active only by default)
 # =========================
 _GOOG_FIN_BASE = "https://www.google.com/finance/markets/"
 _GOOG_PAGES_MAP = {
     "most-active": "most-active",
-    "gainers": "gainers",
-    "losers": "losers",
 }
-# e.g. /finance/quote/TSLA:NASDAQ
-_GOOG_TICKER_HREF_RE = re.compile(r"/finance/quote/([A-Z][A-Z0-9\.-]{0,11}):")
+# match /finance/quote/TSLA:NASDAQ  (exchange suffix optional)
+_GOOG_TICKER_HREF_RE = re.compile(r"/finance/quote/([A-Z][A-Z0-9\.-]{0,11})(?::[A-Z]+)?")
+# some components also carry data-symbol="TSLA"
+_GOOG_DATA_SYMBOL_RE = re.compile(r'data-symbol="([A-Z][A-Z0-9\.-]{0,11})"')
 
 def get_google_finance_page_symbols(page_key: str) -> List[str]:
     path = _GOOG_PAGES_MAP.get(page_key.strip().lower())
     if not path:
         return []
-    url = _GOOG_FIN_BASE + path
-    html = fetch_text_with_retries(url, headers=UA, timeout=20)
+    # Force US/EN to reduce variability; avoid locale consent detours
+    url = _GOOG_FIN_BASE + path + "?hl=en&gl=US&ceid=US:en"
+    headers = {
+        **UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+    html = fetch_text_with_retries(url, headers=headers, timeout=20)
     syms = {m.group(1).upper() for m in _GOOG_TICKER_HREF_RE.finditer(html)}
+    syms.update({m.group(1).upper() for m in _GOOG_DATA_SYMBOL_RE.finditer(html)})
     syms = {s for s in syms if 1 <= len(s) <= 12}
     return sorted(syms)
 
@@ -298,7 +306,6 @@ def get_google_finance_symbols() -> List[Tuple[str, List[str]]]:
 # =========================
 # Scraper orchestration
 # =========================
-
 def collect_sources() -> List[Tuple[str, List[str]]]:
     sources: List[Tuple[str, List[str]]] = []
 
@@ -310,11 +317,11 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
         except Exception as e:
             logging.info(f"{name}: skipped ({e})")
 
-    # Stocks only
+    # Stocks only (trending/most active)
     try_add("Yahoo Finance - Trending (US)", get_yahoo_trending_stocks)
     try_add("Yahoo Finance - Most Active", get_yahoo_most_active)
 
-    # New: Google Finance (multiple pages)
+    # Google Finance most-active (optional; disabled by default)
     if GOOGLE_FINANCE_ENABLED:
         for name, syms in get_google_finance_symbols():
             sources.append((name, syms))
@@ -323,7 +330,7 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
     for name, syms in get_stocktwits_sentiment_sets():
         sources.append((name, syms))
 
-    # New: Reddit (aggregate across subs)
+    # Reddit aggregate across subs (optional; disabled by default)
     if REDDIT_ENABLED:
         try:
             r_syms = get_reddit_symbols()
@@ -332,7 +339,6 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
             logging.info(f"Reddit aggregate: skipped ({e})")
 
     return sources
-
 
 def combine_sources_to_rows(sources: List[Tuple[str, List[str]]]) -> List[List[str]]:
     ts = datetime.now(timezone.utc).isoformat()
@@ -372,7 +378,6 @@ def score_messages(msgs: List[Dict]) -> Dict:
 # =========================
 # Formatting helper (uses GridRange)
 # =========================
-
 def apply_sentiment_conditional_formats(ws):
     set_frozen(ws, rows=1)
     format_cell_ranges(ws, [
@@ -409,7 +414,6 @@ def apply_sentiment_conditional_formats(ws):
 # =========================
 # Main pipeline
 # =========================
-
 def run_scraper(gc):
     sh = open_sheet(gc)
     ws = ensure_worksheet(sh, SCRAPER_WS, 10000, 6)
