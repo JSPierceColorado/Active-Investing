@@ -172,7 +172,7 @@ def replace_sheet(ws, rows: List[List[object]], header: List[str]):
     ws.clear()
     ws.append_row(header, value_input_option="RAW")
     if rows:
-        rows = _json_safe_rows(rows)  # sanitize to avoid NaN/Inf JSON errors
+        rows = _json_safe_rows(rows)  # <<< sanitize to avoid NaN/Inf JSON errors
         CHUNK = 500
         for i in range(0, len(rows), CHUNK):
             ws.append_rows(rows[i:i+CHUNK], value_input_option="RAW")
@@ -335,6 +335,49 @@ def _extract_tickers(text: str) -> List[str]:
     return [c for c in cands if c not in _TICKER_BLACKLIST and 1 < len(c) <= 5]
 
 # =========================
+# Reddit fetchers (r/wallstreetbets, r/finance, etc.)
+# =========================
+def _reddit_listing_url(sub: str, sort: str, limit: int, t: str) -> str:
+    # e.g. https://www.reddit.com/r/wallstreetbets/hot.json?limit=100&t=day
+    sort = sort.lower()
+    base = f"https://www.reddit.com/r/{sub}/{sort}.json"
+    params = {"limit": str(min(limit, 100))}
+    if sort == "top":
+        params["t"] = t
+    return base + "?" + "&".join([f"{k}={v}" for k, v in params.items()])
+
+def get_reddit_symbols_from_subreddit(subreddit: str, *, sort: str, limit: int, t: str) -> List[str]:
+    url = _reddit_listing_url(subreddit, sort, limit, t)
+    headers = {**UA, "Accept": "application/json"}
+    data = fetch_json_with_retries(url, headers=headers, timeout=15)
+    children = (data.get("data", {}) or {}).get("children", []) or []
+    found: set = set()
+    for ch in children:
+        post = (ch.get("data") or {})
+        title = post.get("title") or ""
+        selftext = post.get("selftext") or ""
+        for part in (title, selftext):
+            for sym in _extract_tickers(part):
+                found.add(sym)
+    return sorted(found)
+
+def get_reddit_symbols() -> List[str]:
+    if not REDDIT_ENABLED:
+        return []
+    all_syms: set = set()
+    for sub in [s.strip() for s in REDDIT_SUBREDDITS if s.strip()]:
+        try:
+            syms = get_reddit_symbols_from_subreddit(
+                sub, sort=REDDIT_SORT, limit=REDDIT_LIMIT, t=REDDIT_TIME_FILTER
+            )
+            logging.info(f"Reddit r/{sub}: extracted {len(syms)} symbols.")
+            all_syms.update(syms)
+            _sleep_with_jitter(0.6)  # be nice to Reddit
+        except Exception as e:
+            logging.info(f"Reddit r/{sub}: skipped ({e})")
+    return sorted(all_syms)
+
+# =========================
 # Google Finance markets (most-active only by default)
 # =========================
 _GOOG_FIN_BASE = "https://www.google.com/finance/markets/"
@@ -467,24 +510,18 @@ def score_messages(msgs: List[Dict]) -> Dict:
 # =========================
 # Alpaca indicators + flag rules (⭐ / 🔻 / ▲)
 # =========================
-ALPACA_API_KEY_ID     = os.getenv("ALPACA_API_KEY_ID", "")
-ALPACA_API_SECRET_KEY = os.getenv("ALPACA_API_SECRET_KEY", "")
-ALPACA_DATA_BASE      = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets")
-# Hard-default to IEX; even if env var is empty, keep "iex"
-ALPACA_FEED           = (os.getenv("ALPACA_FEED", "iex") or "iex").lower()  # "iex" or "sip"
+ALPACA_API_KEY_ID    = os.getenv("ALPACA_API_KEY_ID", "")
+ALPACA_API_SECRET_KEY= os.getenv("ALPACA_API_SECRET_KEY", "")
+ALPACA_DATA_BASE     = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets")
+ALPACA_FEED          = os.getenv("ALPACA_FEED", "iex")  # "iex" or "sip" (paid)
 
-SENT_POS_THRESH       = float(os.getenv("SENT_POS_THRESH", "0.05"))
-SENT_NEG_THRESH       = float(os.getenv("SENT_NEG_THRESH", "-0.05"))
-RSI_MOMO_MAX          = float(os.getenv("RSI_MOMO_MAX", "60"))
-MOMENTUM_GOOD_THRESH  = float(os.getenv("MOMENTUM_GOOD_THRESH", "0.10"))
+SENT_POS_THRESH      = float(os.getenv("SENT_POS_THRESH", "0.05"))
+SENT_NEG_THRESH      = float(os.getenv("SENT_NEG_THRESH", "-0.05"))
+RSI_MOMO_MAX         = float(os.getenv("RSI_MOMO_MAX", "60"))
+MOMENTUM_GOOD_THRESH = float(os.getenv("MOMENTUM_GOOD_THRESH", "0.10"))
 
 def _alpaca_enabled() -> bool:
-    ok = bool(ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY)
-    if ok:
-        logging.info(f"Alpaca enabled (feed={ALPACA_FEED})")
-    else:
-        logging.info("Alpaca disabled (missing keys); flags will be blank.")
-    return ok
+    return bool(ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY)
 
 def get_alpaca_bars_15m(symbol: str, limit: int = 1000) -> List[float]:
     if not _alpaca_enabled():
@@ -495,34 +532,15 @@ def get_alpaca_bars_15m(symbol: str, limit: int = 1000) -> List[float]:
         "APCA-API-SECRET-KEY": ALPACA_API_SECRET_KEY,
     }
     url = f"{ALPACA_DATA_BASE}/v2/stocks/{symbol}/bars"
-    params = {
-        "timeframe": "15Min",
-        "limit": str(limit),
-        "adjustment": "raw",
-        "feed": ALPACA_FEED,  # should be "iex" on free plans
-    }
-    try:
-        data = fetch_json_with_retries(url, params=params, headers=headers, timeout=20)
-    except Exception as e:
-        logging.info(f"Alpaca bars error {symbol}: {e}")
-        return []
-
-    bars = data.get("bars") or []
-    if not bars:
-        # Common reasons: symbol not covered by IEX, very new issue, market closed initial window
-        logging.info(f"Alpaca (feed={ALPACA_FEED}) returned 0 bars for {symbol} on 15Min")
-        return []
-
+    params = {"timeframe": "15Min", "limit": str(limit), "adjustment": "raw", "feed": ALPACA_FEED}
+    data = fetch_json_with_retries(url, params=params, headers=headers, timeout=20)
+    bars = data.get("bars", []) or []
     closes: List[float] = []
     for b in bars:
-        c = b.get("c")
         try:
-            closes.append(float(c))
+            closes.append(float(b.get("c")))
         except Exception:
             continue
-
-    if not closes:
-        logging.info(f"Alpaca (feed={ALPACA_FEED}) had bars but no valid closes for {symbol}")
     return closes
 
 def sma(values: List[float], window: int) -> float:
@@ -675,8 +693,6 @@ def run_sentiment(gc):
                     rsi = rsi14(closes)
                     ma60 = sma(closes, 60)
                     ma240 = sma(closes, 240)
-                else:
-                    logging.info(f"No 15m data → no flag for {s} (feed={ALPACA_FEED})")
 
             # Decide leftmost flag
             flag = pick_flag(sent, momentum, rsi, ma60, ma240)
