@@ -1,5 +1,5 @@
 import os, json, sys, time, logging, random, re, statistics, math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Dict
 
 import requests
@@ -514,6 +514,7 @@ ALPACA_API_KEY_ID    = os.getenv("ALPACA_API_KEY_ID", "")
 ALPACA_API_SECRET_KEY= os.getenv("ALPACA_API_SECRET_KEY", "")
 ALPACA_DATA_BASE     = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets")
 ALPACA_FEED          = os.getenv("ALPACA_FEED", "iex")  # "iex" or "sip" (paid)
+ALPACA_LOOKBACK_DAYS = int(os.getenv("ALPACA_LOOKBACK_DAYS", "30"))
 
 SENT_POS_THRESH      = float(os.getenv("SENT_POS_THRESH", "0.05"))
 SENT_NEG_THRESH      = float(os.getenv("SENT_NEG_THRESH", "-0.05"))
@@ -529,7 +530,7 @@ def _enough_bars_for_rsi(values: List[float]) -> bool:
 def _enough_bars_for_ma(values: List[float], win: int) -> bool:
     return len(values) >= win
 
-def get_alpaca_bars_15m(symbol: str, limit: int = 1000) -> List[float]:
+def get_alpaca_bars_15m(symbol: str, limit: int = 2000) -> List[float]:
     if not _alpaca_enabled():
         logging.info(f"[Alpaca] Disabled or missing API keys — skipping {symbol}")
         return []
@@ -539,9 +540,20 @@ def get_alpaca_bars_15m(symbol: str, limit: int = 1000) -> List[float]:
         "APCA-API-SECRET-KEY": ALPACA_API_SECRET_KEY,
     }
     url = f"{ALPACA_DATA_BASE}/v2/stocks/{symbol}/bars"
-    params = {"timeframe": "15Min", "limit": str(limit), "adjustment": "raw", "feed": ALPACA_FEED}
+
+    # Ask for multiple days of history so MA60/MA240 can be computed.
+    start_dt = datetime.now(timezone.utc) - timedelta(days=ALPACA_LOOKBACK_DAYS)
+    start_iso = start_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    params = {
+        "timeframe": "15Min",
+        "adjustment": "raw",
+        "feed": ALPACA_FEED,
+        "start": start_iso,   # <-- crucial for multi-day history
+        "limit": str(limit),  # safety cap; 30d * ~26 bars/day ≈ < 1000
+    }
     try:
-        logging.info(f"[Alpaca] Fetching {symbol} bars (15Min, feed={ALPACA_FEED})")
+        logging.info(f"[Alpaca] Fetching {symbol} bars (15Min, feed={ALPACA_FEED}, lookback={ALPACA_LOOKBACK_DAYS}d)")
         data = fetch_json_with_retries(url, params=params, headers=headers, timeout=20)
         bars = data.get("bars", []) or []
         closes: List[float] = []
@@ -712,7 +724,7 @@ def run_sentiment(gc):
             rsi = ma60 = ma240 = float("nan")
             if _alpaca_enabled():
                 alpaca_attempted += 1
-                closes = get_alpaca_bars_15m(s, limit=1000)
+                closes = get_alpaca_bars_15m(s, limit=2000)
                 if closes:
                     alpaca_bars_ok += 1
                     # Availability checks
@@ -795,7 +807,8 @@ def main():
     if _alpaca_enabled():
         logging.info("[Alpaca] Connection enabled — using API key ID ending with: "
                      f"{ALPACA_API_KEY_ID[-4:]}")
-        logging.info(f"[Alpaca] Data base: {ALPACA_DATA_BASE} | Feed: {ALPACA_FEED}")
+        logging.info(f"[Alpaca] Data base: {ALPACA_DATA_BASE} | Feed: {ALPACA_FEED} | "
+                     f"Lookback days: {ALPACA_LOOKBACK_DAYS}")
     else:
         logging.info("[Alpaca] Disabled — skipping technical indicators.")
     run_scraper(gc)
