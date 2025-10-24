@@ -408,18 +408,18 @@ def get_google_finance_page_symbols(page_key: str) -> List[str]:
     return sorted(syms)
 
 def get_google_finance_symbols() -> List[Tuple[str, List[str]]]:
-    if not GOOGLE_FINANCE_ENABLED:
-        return []
-    out: List[Tuple[str, List[str]]] = []
-    for key in [k.strip() for k in GOOGLE_FINANCE_PAGES if k.strip()]:
-        try:
-            syms = get_google_finance_page_symbols(key)
-            logging.info(f"Google Finance - {key}: scraped {len(syms)} symbols.")
-            out.append((f"Google Finance - {key.title()}", syms))
-            _sleep_with_jitter(0.4)
-        except Exception as e:
-            logging.info(f"Google Finance - {key}: skipped ({e})")
-    return out
+    if GOOGLE_FINANCE_ENABLED:
+        out: List[Tuple[str, List[str]]] = []
+        for key in [k.strip() for k in GOOGLE_FINANCE_PAGES if k.strip()]:
+            try:
+                syms = get_google_finance_page_symbols(key)
+                logging.info(f"Google Finance - {key}: scraped {len(syms)} symbols.")
+                out.append((f"Google Finance - {key.title()}", syms))
+                _sleep_with_jitter(0.4)
+            except Exception as e:
+                logging.info(f"Google Finance - {key}: skipped ({e})")
+        return out
+    return []
 
 # =========================
 # Scraper orchestration
@@ -695,8 +695,12 @@ def run_sentiment(gc):
     # Collect symbols (unique), cap to limit
     syms = sorted({r[2].strip().upper() for r in rows if len(r) >= 3 and r[2].strip()})[:SENTIMENT_SYMBOL_LIMIT]
 
-    # ---- Alpaca coverage counters (for summary) ----
+    # ---- Alpaca coverage + skip counters (for summary) ----
     total_syms = len(syms)
+    kept_rows = 0
+    skipped_no_msgs = 0
+    skipped_no_bars = 0
+
     alpaca_attempted = 0
     alpaca_bars_ok = 0
     alpaca_rsi_ready = 0
@@ -707,8 +711,14 @@ def run_sentiment(gc):
     out = []
     for i, s in enumerate(syms, 1):
         try:
+            # 1) Fetch Stocktwits messages; REQUIRE data or skip
             msgs = fetch_stocktwits_messages(s, SENTIMENT_MSGS_PER_SYM)
             sc = score_messages(msgs)
+            if sc["n"] <= 0:
+                skipped_no_msgs += 1
+                logging.info(f"[Sentiment] {s}: no Stocktwits messages — skipping row")
+                _sleep_with_jitter(SENTIMENT_REQ_SLEEP_S)
+                continue
 
             coverage = source_map.get(s, 1)
             sent = 0.6 * sc["tmean"] + 0.4 * sc["median"]
@@ -720,30 +730,32 @@ def run_sentiment(gc):
             rank = 0.5 * coverage_term + 0.35 * sent + 0.15 * momentum
             rank = round(rank, 4)
 
-            # Indicators via Alpaca (15m)
+            # 2) Indicators via Alpaca (15m); if Alpaca enabled, REQUIRE bars or skip
             rsi = ma60 = ma240 = float("nan")
             if _alpaca_enabled():
                 alpaca_attempted += 1
                 closes = get_alpaca_bars_15m(s, limit=2000)
-                if closes:
-                    alpaca_bars_ok += 1
-                    # Availability checks
-                    if _enough_bars_for_rsi(closes):
-                        alpaca_rsi_ready += 1
-                    if _enough_bars_for_ma(closes, 60):
-                        alpaca_ma60_ready += 1
-                    if _enough_bars_for_ma(closes, 240):
-                        alpaca_ma240_ready += 1
+                if not closes:
+                    skipped_no_bars += 1
+                    logging.info(f"[Alpaca] {s}: no bar data — skipping row")
+                    _sleep_with_jitter(SENTIMENT_REQ_SLEEP_S)
+                    continue
 
-                    rsi = rsi14(closes)
-                    ma60 = sma(closes, 60)
-                    ma240 = sma(closes, 240)
-                    logging.info(f"[Alpaca] {s}: RSI={rsi}, MA60={ma60}, MA240={ma240}")
+                alpaca_bars_ok += 1
+                if _enough_bars_for_rsi(closes):
+                    alpaca_rsi_ready += 1
+                if _enough_bars_for_ma(closes, 60):
+                    alpaca_ma60_ready += 1
+                if _enough_bars_for_ma(closes, 240):
+                    alpaca_ma240_ready += 1
 
-                    if not any(math.isnan(x) for x in (rsi, ma60, ma240)):
-                        alpaca_full_indicators_ready += 1
-                else:
-                    logging.info(f"[Alpaca] {s}: no bar data returned")
+                rsi = rsi14(closes)
+                ma60 = sma(closes, 60)
+                ma240 = sma(closes, 240)
+                logging.info(f"[Alpaca] {s}: RSI={rsi}, MA60={ma60}, MA240={ma240}")
+
+                if not any(math.isnan(x) for x in (rsi, ma60, ma240)):
+                    alpaca_full_indicators_ready += 1
 
             # Decide leftmost flag
             flag = pick_flag(sent, momentum, rsi, ma60, ma240)
@@ -755,6 +767,8 @@ def run_sentiment(gc):
                 rsi, ma60, ma240,
                 datetime.now(timezone.utc).isoformat()
             ])
+            kept_rows += 1
+
         except Exception as e:
             logging.info(f"{s} sentiment skip: {e}")
         if i % 25 == 0:
@@ -779,10 +793,17 @@ def run_sentiment(gc):
     except Exception:
         pass
 
-    # ---- Summary of Alpaca coverage ----
+    # ---- Summary of coverage and skips ----
+    logging.info("[Sentiment Summary] -------------------------------")
+    logging.info(f"[Sentiment Summary] Symbols from scraper: {total_syms}")
+    logging.info(f"[Sentiment Summary] Kept rows written:  {kept_rows}")
+    logging.info(f"[Sentiment Summary] Skipped (no ST msgs): {skipped_no_msgs}")
+    if _alpaca_enabled():
+        logging.info(f"[Sentiment Summary] Skipped (no Alpaca bars): {skipped_no_bars}")
+    logging.info("[Sentiment Summary] --------------------------------")
+
     if _alpaca_enabled():
         logging.info("[Alpaca Summary] -------------------------------")
-        logging.info(f"[Alpaca Summary] Symbols processed: {total_syms}")
         logging.info(f"[Alpaca Summary] Attempted fetch: {alpaca_attempted}")
         logging.info(f"[Alpaca Summary] Got any bars:   {alpaca_bars_ok}/{alpaca_attempted}")
         logging.info(f"[Alpaca Summary] RSI-ready (≥15): {alpaca_rsi_ready}/{alpaca_attempted}")
@@ -810,7 +831,7 @@ def main():
         logging.info(f"[Alpaca] Data base: {ALPACA_DATA_BASE} | Feed: {ALPACA_FEED} | "
                      f"Lookback days: {ALPACA_LOOKBACK_DAYS}")
     else:
-        logging.info("[Alpaca] Disabled — skipping technical indicators.")
+        logging.info("[Alpaca] Disabled — technical indicators will be skipped, but rows require Stocktwits data.")
     run_scraper(gc)
     run_sentiment(gc)
     run_demo(gc)
