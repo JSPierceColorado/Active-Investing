@@ -114,6 +114,34 @@ def _pace(url: str, base_delay=0.15):
     _next_ok_at[host] = time.time() + base_delay * random.uniform(0.9, 1.3)
 
 # =========================
+# JSON-safe writers (fix NaN crash)
+# =========================
+def _json_safe_cell(v):
+    """Convert NaN/Inf/None/odd types to Sheets-safe JSON."""
+    if v is None:
+        return ""
+    try:
+        if isinstance(v, float):
+            if math.isnan(v) or math.isinf(v):
+                return ""
+            return v
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            return v
+        if hasattr(v, "__float__"):
+            f = float(v)
+            if math.isnan(f) or math.isinf(f):
+                return ""
+            return f
+    except Exception:
+        pass
+    return str(v)
+
+def _json_safe_rows(rows: List[List[object]]) -> List[List[object]]:
+    return [[_json_safe_cell(c) for c in row] for row in rows]
+
+# =========================
 # Google Sheets helpers
 # =========================
 def get_client():
@@ -137,17 +165,18 @@ def ensure_worksheet(sh, title: str, rows: int = 1000, cols: int = 10):
             return sh.add_worksheet(title=title, rows=1, cols=1) if False else sh.worksheet(sh.worksheets()[0].title)
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
-def replace_sheet(ws, rows: List[List[str]], header: List[str]):
+def replace_sheet(ws, rows: List[List[object]], header: List[str]):
     if DRY_RUN:
         logging.info(f"[DRY_RUN] Would write {len(rows)} rows to '{ws.title}' with header {header}")
         return
     ws.clear()
     ws.append_row(header, value_input_option="RAW")
     if rows:
+        rows = _json_safe_rows(rows)  # <<< sanitize to avoid NaN/Inf JSON errors
         CHUNK = 500
         for i in range(0, len(rows), CHUNK):
             ws.append_rows(rows[i:i+CHUNK], value_input_option="RAW")
-    logging.info(f"Wrote {len(rows)} rows to '{ws.title}'.")
+    logging.info(f"Wrote {len(rows) if rows else 0} rows to '{ws.title}'.")
 
 # =========================
 # HTTP helpers (429-aware) using session + pacing
@@ -272,12 +301,21 @@ def get_stocktwits_sentiment_sets() -> List[Tuple[str, List[str]]]:
             logging.info(f"{name}: skipped ({e})")
     return sources
 
+# Some symbols (often futures) 404 on Stocktwits; skip quietly
+_STW_SKIP = {"YM", "ES", "NQ", "RTY", "CL", "GC", "ZN", "ZF", "ZB"}
+
 def fetch_stocktwits_messages(symbol: str, limit: int) -> List[Dict]:
+    if symbol in _STW_SKIP:
+        return []
     url = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
     headers = {**UA, "Accept": "application/json, text/plain, */*"}
     params = {"limit": str(limit)}
-    data = fetch_json_with_retries(url, headers=headers, params=params, timeout=15)
-    return data.get("messages", []) or []
+    try:
+        data = fetch_json_with_retries(url, headers=headers, params=params, timeout=15)
+        return data.get("messages", []) or []
+    except Exception as e:
+        logging.info(f"{symbol} sentiment skip: {e}")
+        return []
 
 # =========================
 # Lightweight ticker extraction for arbitrary text
