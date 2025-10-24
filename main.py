@@ -523,8 +523,15 @@ MOMENTUM_GOOD_THRESH = float(os.getenv("MOMENTUM_GOOD_THRESH", "0.10"))
 def _alpaca_enabled() -> bool:
     return bool(ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY)
 
+def _enough_bars_for_rsi(values: List[float]) -> bool:
+    return len(values) >= 15  # RSI14 needs >=15 closes
+
+def _enough_bars_for_ma(values: List[float], win: int) -> bool:
+    return len(values) >= win
+
 def get_alpaca_bars_15m(symbol: str, limit: int = 1000) -> List[float]:
     if not _alpaca_enabled():
+        logging.info(f"[Alpaca] Disabled or missing API keys — skipping {symbol}")
         return []
     headers = {
         **UA,
@@ -533,15 +540,22 @@ def get_alpaca_bars_15m(symbol: str, limit: int = 1000) -> List[float]:
     }
     url = f"{ALPACA_DATA_BASE}/v2/stocks/{symbol}/bars"
     params = {"timeframe": "15Min", "limit": str(limit), "adjustment": "raw", "feed": ALPACA_FEED}
-    data = fetch_json_with_retries(url, params=params, headers=headers, timeout=20)
-    bars = data.get("bars", []) or []
-    closes: List[float] = []
-    for b in bars:
-        try:
-            closes.append(float(b.get("c")))
-        except Exception:
-            continue
-    return closes
+    try:
+        logging.info(f"[Alpaca] Fetching {symbol} bars (15Min, feed={ALPACA_FEED})")
+        data = fetch_json_with_retries(url, params=params, headers=headers, timeout=20)
+        bars = data.get("bars", []) or []
+        closes: List[float] = []
+        for b in bars:
+            try:
+                closes.append(float(b.get("c")))
+            except Exception:
+                continue
+        logging.info(f"[Alpaca] {symbol}: received {len(closes)} closes "
+                     f"(need ≥15 for RSI, ≥60 for MA60, ≥240 for MA240)")
+        return closes
+    except Exception as e:
+        logging.warning(f"[Alpaca] Error fetching bars for {symbol}: {e}")
+        return []
 
 def sma(values: List[float], window: int) -> float:
     if len(values) < window:
@@ -669,6 +683,15 @@ def run_sentiment(gc):
     # Collect symbols (unique), cap to limit
     syms = sorted({r[2].strip().upper() for r in rows if len(r) >= 3 and r[2].strip()})[:SENTIMENT_SYMBOL_LIMIT]
 
+    # ---- Alpaca coverage counters (for summary) ----
+    total_syms = len(syms)
+    alpaca_attempted = 0
+    alpaca_bars_ok = 0
+    alpaca_rsi_ready = 0
+    alpaca_ma60_ready = 0
+    alpaca_ma240_ready = 0
+    alpaca_full_indicators_ready = 0  # RSI + MA60 + MA240 all computed (non-NaN)
+
     out = []
     for i, s in enumerate(syms, 1):
         try:
@@ -688,11 +711,27 @@ def run_sentiment(gc):
             # Indicators via Alpaca (15m)
             rsi = ma60 = ma240 = float("nan")
             if _alpaca_enabled():
+                alpaca_attempted += 1
                 closes = get_alpaca_bars_15m(s, limit=1000)
                 if closes:
+                    alpaca_bars_ok += 1
+                    # Availability checks
+                    if _enough_bars_for_rsi(closes):
+                        alpaca_rsi_ready += 1
+                    if _enough_bars_for_ma(closes, 60):
+                        alpaca_ma60_ready += 1
+                    if _enough_bars_for_ma(closes, 240):
+                        alpaca_ma240_ready += 1
+
                     rsi = rsi14(closes)
                     ma60 = sma(closes, 60)
                     ma240 = sma(closes, 240)
+                    logging.info(f"[Alpaca] {s}: RSI={rsi}, MA60={ma60}, MA240={ma240}")
+
+                    if not any(math.isnan(x) for x in (rsi, ma60, ma240)):
+                        alpaca_full_indicators_ready += 1
+                else:
+                    logging.info(f"[Alpaca] {s}: no bar data returned")
 
             # Decide leftmost flag
             flag = pick_flag(sent, momentum, rsi, ma60, ma240)
@@ -728,6 +767,19 @@ def run_sentiment(gc):
     except Exception:
         pass
 
+    # ---- Summary of Alpaca coverage ----
+    if _alpaca_enabled():
+        logging.info("[Alpaca Summary] -------------------------------")
+        logging.info(f"[Alpaca Summary] Symbols processed: {total_syms}")
+        logging.info(f"[Alpaca Summary] Attempted fetch: {alpaca_attempted}")
+        logging.info(f"[Alpaca Summary] Got any bars:   {alpaca_bars_ok}/{alpaca_attempted}")
+        logging.info(f"[Alpaca Summary] RSI-ready (≥15): {alpaca_rsi_ready}/{alpaca_attempted}")
+        logging.info(f"[Alpaca Summary] MA60-ready (≥60): {alpaca_ma60_ready}/{alpaca_attempted}")
+        logging.info(f"[Alpaca Summary] MA240-ready (≥240): {alpaca_ma240_ready}/{alpaca_attempted}")
+        logging.info(f"[Alpaca Summary] Full indicators (RSI+MA60+MA240 computed): "
+                     f"{alpaca_full_indicators_ready}/{alpaca_attempted}")
+        logging.info("[Alpaca Summary] --------------------------------")
+
 def run_demo(gc):
     if not DEMO_APPEND_ENABLED:
         return
@@ -740,6 +792,12 @@ def run_demo(gc):
 
 def main():
     gc = get_client()
+    if _alpaca_enabled():
+        logging.info("[Alpaca] Connection enabled — using API key ID ending with: "
+                     f"{ALPACA_API_KEY_ID[-4:]}")
+        logging.info(f"[Alpaca] Data base: {ALPACA_DATA_BASE} | Feed: {ALPACA_FEED}")
+    else:
+        logging.info("[Alpaca] Disabled — skipping technical indicators.")
     run_scraper(gc)
     run_sentiment(gc)
     run_demo(gc)
