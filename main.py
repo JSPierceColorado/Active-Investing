@@ -5,7 +5,6 @@ from typing import List, Tuple, Dict
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ✅ Use GridRange + string "NUMBER" types (compatible with older gspread-formatting)
 from gspread_formatting import (
@@ -43,7 +42,7 @@ REDDIT_LIMIT              = int(os.getenv("REDDIT_LIMIT", "150"))  # per subredd
 REDDIT_TIME_FILTER        = os.getenv("REDDIT_TIME_FILTER", "day")  # hour|day|week|month|year|all
 
 GOOGLE_FINANCE_ENABLED    = os.getenv("GOOGLE_FINANCE_ENABLED", "0") not in {"0", "false", "False"}
-# Only most-active by default (no gainers/losers wired in)
+# Pages supported: most-active, gainers, losers (enable via GOOGLE_FINANCE_PAGES env)
 GOOGLE_FINANCE_PAGES      = os.getenv("GOOGLE_FINANCE_PAGES", "most-active").split(",")
 
 # Optional: idempotent demo logging and dry-run switch
@@ -252,9 +251,9 @@ def get_yahoo_trending_stocks() -> List[str]:
         pass
     return out
 
-def get_yahoo_most_active() -> List[str]:
+def _get_yahoo_predefined(scr_id: str, count: int = 100) -> List[str]:
     url = "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
-    params = {"scrIds": "most_actives", "count": "100", "lang": "en-US", "region": "US"}
+    params = {"scrIds": scr_id, "count": str(count), "lang": "en-US", "region": "US"}
     data = fetch_json_with_retries(url, params=params)
     out = []
     try:
@@ -269,6 +268,16 @@ def get_yahoo_most_active() -> List[str]:
     except Exception:
         pass
     return out
+
+def get_yahoo_most_active() -> List[str]:
+    return _get_yahoo_predefined("most_actives")
+
+# ⭐ New sources:
+def get_yahoo_day_gainers() -> List[str]:
+    return _get_yahoo_predefined("day_gainers")
+
+def get_yahoo_day_losers() -> List[str]:
+    return _get_yahoo_predefined("day_losers")
 
 # =========================
 # Stocktwits (lists + messages)
@@ -318,8 +327,7 @@ def fetch_stocktwits_messages(symbol: str, limit: int) -> List[Dict]:
         return []
 
 # =========================
-# Lightweight ticker extraction for arbitrary text
-# (kept as-is per request)
+# Lightweight ticker extraction for arbitrary text (Reddit)
 # =========================
 _TICKER_RE = re.compile(r"\b[A-Z][A-Z0-9\.]{1,4}\b")  # 2–5 chars, allow '.' like BRK.B
 _TICKER_BLACKLIST = {
@@ -335,10 +343,9 @@ def _extract_tickers(text: str) -> List[str]:
     return [c for c in cands if c not in _TICKER_BLACKLIST and 1 < len(c) <= 5]
 
 # =========================
-# Reddit fetchers (r/wallstreetbets, r/finance, etc.)
+# Reddit fetchers (optional)
 # =========================
 def _reddit_listing_url(sub: str, sort: str, limit: int, t: str) -> str:
-    # e.g. https://www.reddit.com/r/wallstreetbets/hot.json?limit=100&t=day
     sort = sort.lower()
     base = f"https://www.reddit.com/r/{sub}/{sort}.json"
     params = {"limit": str(min(limit, 100))}
@@ -378,11 +385,13 @@ def get_reddit_symbols() -> List[str]:
     return sorted(all_syms)
 
 # =========================
-# Google Finance markets (most-active only by default)
+# Google Finance markets (most-active/gainers/losers)
 # =========================
 _GOOG_FIN_BASE = "https://www.google.com/finance/markets/"
 _GOOG_PAGES_MAP = {
     "most-active": "most-active",
+    "gainers": "gainers",
+    "losers": "losers",
 }
 # match /finance/quote/TSLA:NASDAQ  (exchange suffix optional)
 _GOOG_TICKER_HREF_RE = re.compile(r"/finance/quote/([A-Z][A-Z0-9\.-]{0,11})(?::[A-Z]+)?")
@@ -393,7 +402,6 @@ def get_google_finance_page_symbols(page_key: str) -> List[str]:
     path = _GOOG_PAGES_MAP.get(page_key.strip().lower())
     if not path:
         return []
-    # Force US/EN to reduce variability; avoid locale consent detours
     url = _GOOG_FIN_BASE + path + "?hl=en&gl=US&ceid=US:en"
     headers = {
         **UA,
@@ -435,16 +443,18 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
         except Exception as e:
             logging.info(f"{name}: skipped ({e})")
 
-    # Stocks only (trending/most active)
+    # Stocks only (trending/most active + NEW gainers/losers)
     try_add("Yahoo Finance - Trending (US)", get_yahoo_trending_stocks)
     try_add("Yahoo Finance - Most Active", get_yahoo_most_active)
+    try_add("Yahoo Finance - Day Gainers", get_yahoo_day_gainers)
+    try_add("Yahoo Finance - Day Losers", get_yahoo_day_losers)
 
-    # Google Finance most-active (optional; disabled by default)
+    # Google Finance pages (optional)
     if GOOGLE_FINANCE_ENABLED:
         for name, syms in get_google_finance_symbols():
             sources.append((name, syms))
 
-    # Stocktwits sentiment lists (symbols only; scoring happens later)
+    # Stocktwits sentiment lists (symbols only; per-message sentiment scored later)
     for name, syms in get_stocktwits_sentiment_sets():
         sources.append((name, syms))
 
@@ -467,45 +477,27 @@ def combine_sources_to_rows(sources: List[Tuple[str, List[str]]]) -> List[List[s
     return [[", ".join(sorted(v)), ts, k] for k, v in sorted(sym_to_src.items())]
 
 # =========================
-# Sentiment analysis (stocks) + ranking
+# Direct Stocktwits sentiment (no VADER)
 # =========================
-_analyzer = SentimentIntensityAnalyzer()
-
-def _trimmed_mean(vals: List[float], p: float = 0.1) -> float:
-    if not vals:
-        return 0.0
-    vals = sorted(vals)
-    k = max(0, int(len(vals) * p))
-    core = vals[k:len(vals) - k] or vals
-    return round(sum(core) / len(core), 4)
-
-def score_messages(msgs: List[Dict]) -> Dict:
-    scores, pos, neg, neu = [], 0, 0, 0
+def tally_stocktwits_sentiment(msgs: List[Dict]) -> Dict[str, float]:
+    """
+    Count Bullish/Bearish from Stocktwits message tags.
+    Neutral = messages with no sentiment tag or unrecognized tag.
+    Returns: dict with bulls, bears, neu, n, delta
+    """
+    bulls = bears = neu = 0
     for m in msgs:
-        text = (m.get("body") or "").strip()
-        if not text:
-            continue
-        c = _analyzer.polarity_scores(text)["compound"]
-        scores.append(c)
-        if c >= 0.05:
-            pos += 1
-        elif c <= -0.05:
-            neg += 1
+        ent = m.get("entities") or {}
+        sent = (ent.get("sentiment") or {}).get("basic")  # "Bullish" / "Bearish" / None
+        if sent == "Bullish":
+            bulls += 1
+        elif sent == "Bearish":
+            bears += 1
         else:
             neu += 1
-    n = len(scores)
-    if not n:
-        return {"mean": 0, "median": 0, "tmean": 0, "n": 0, "pos": 0, "neg": 0, "neu": 0, "delta": 0}
-    return {
-        "mean": round(sum(scores) / n, 4),
-        "median": round(statistics.median(scores), 4),
-        "tmean": _trimmed_mean(scores, 0.1),
-        "n": n,
-        "pos": round(pos / n, 4),
-        "neg": round(neg / n, 4),
-        "neu": round(neu / n, 4),
-        "delta": round((pos - neg) / n, 4),  # bull - bear density
-    }
+    n = bulls + bears + neu
+    delta = 0.0 if n == 0 else round((bulls - bears) / n, 4)
+    return {"bulls": bulls, "bears": bears, "neu": neu, "n": n, "delta": delta}
 
 # =========================
 # Alpaca indicators + flag rules (⭐ / 🔻 / ▲)
@@ -541,7 +533,6 @@ def get_alpaca_bars_15m(symbol: str, limit: int = 2000) -> List[float]:
     }
     url = f"{ALPACA_DATA_BASE}/v2/stocks/{symbol}/bars"
 
-    # Ask for multiple days of history so MA60/MA240 can be computed.
     start_dt = datetime.now(timezone.utc) - timedelta(days=ALPACA_LOOKBACK_DAYS)
     start_iso = start_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -549,8 +540,8 @@ def get_alpaca_bars_15m(symbol: str, limit: int = 2000) -> List[float]:
         "timeframe": "15Min",
         "adjustment": "raw",
         "feed": ALPACA_FEED,
-        "start": start_iso,   # <-- crucial for multi-day history
-        "limit": str(limit),  # safety cap; 30d * ~26 bars/day ≈ < 1000
+        "start": start_iso,
+        "limit": str(limit),
     }
     try:
         logging.info(f"[Alpaca] Fetching {symbol} bars (15Min, feed={ALPACA_FEED}, lookback={ALPACA_LOOKBACK_DAYS}d)")
@@ -610,22 +601,20 @@ def pick_flag(sent_value: float, delta: float, rsi: float, ma60: float, ma240: f
     return ""
 
 # =========================
-# Formatting helper (uses GridRange)
+# Formatting helper (uses GridRange) — updated for fewer columns
 # =========================
 def apply_sentiment_conditional_formats(ws):
     set_frozen(ws, rows=1)
-    # Column map (after adding flag + indicators):
-    # A:flag B:symbol C:mean D:median E:trim_mean F:n_msgs G:pos H:neg I:neu J:delta
-    # K:source_hits L:msgs_factor M:rank N:RSI14_15m O:MA60_15m P:MA240_15m Q:scored_at_utc
+    # Column map (fewer cols):
+    # A:flag B:symbol C:bullish D:bearish E:neutral F:delta G:n_msgs
+    # H:source_hits I:rank J:RSI14_15m K:MA60_15m L:MA240_15m M:scored_at_utc
     format_cell_ranges(ws, [
-        ("C2:E", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
-        ("F2:F", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
-        ("G2:I", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
-        ("J2:J", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
-        ("K2:K", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
-        ("L2:L", CellFormat(numberFormat=NumberFormat(type="PERCENT", pattern="0.00%"))),
-        ("M2:M", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.000"))),
-        ("N2:P", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
+        ("C2:E", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
+        ("F2:F", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.0000"))),
+        ("G2:G", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
+        ("H2:H", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),
+        ("I2:I", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.000"))),
+        ("J2:L", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.00"))),
     ])
 
     red, white, green = Color(0.9, 0.2, 0.2), Color(1, 1, 1), Color(0.2, 0.7, 0.2)
@@ -642,18 +631,10 @@ def apply_sentiment_conditional_formats(ws):
 
     rules = get_conditional_format_rules(ws)
     rules.clear()
-    # Mean/Median/Trimmed: -1 → 0 → +1
-    rules.append(rule("C2:C", -1, 0, 1))
-    rules.append(rule("D2:D", -1, 0, 1))
-    rules.append(rule("E2:E", -1, 0, 1))
-    # Positive ratio: greener when higher
-    rules.append(rule("G2:G", 0, 0.5, 1))
-    # Negative ratio: redder when higher (invert gradient)
-    rules.append(rule("H2:H", 0, 0.5, 1, invert=True))
     # Delta (bull-bear): -1 → 0 → +1
-    rules.append(rule("J2:J", -1, 0, 1))
+    rules.append(rule("F2:F", -1, 0, 1))
     # Rank
-    rules.append(rule("M2:M", -1, 0, 1))
+    rules.append(rule("I2:I", -1, 0, 1))
     rules.save()
 
 # =========================
@@ -661,7 +642,7 @@ def apply_sentiment_conditional_formats(ws):
 # =========================
 def run_scraper(gc):
     sh = open_sheet(gc)
-    ws = ensure_worksheet(sh, SCRAPER_WS, 10000, 6)
+    ws = ensure_worksheet(sh, SCRAPER_WS, 20000, 6)
     data = combine_sources_to_rows(collect_sources())
     replace_sheet(ws, data, ["source","date_utc","symbol"])
 
@@ -713,22 +694,21 @@ def run_sentiment(gc):
         try:
             # 1) Fetch Stocktwits messages; REQUIRE data or skip
             msgs = fetch_stocktwits_messages(s, SENTIMENT_MSGS_PER_SYM)
-            sc = score_messages(msgs)
-            if sc["n"] <= 0:
+            tallies = tally_stocktwits_sentiment(msgs)
+            if tallies["n"] <= 0:
                 skipped_no_msgs += 1
                 logging.info(f"[Sentiment] {s}: no Stocktwits messages — skipping row")
                 _sleep_with_jitter(SENTIMENT_REQ_SLEEP_S)
                 continue
 
             coverage = source_map.get(s, 1)
-            sent = 0.6 * sc["tmean"] + 0.4 * sc["median"]
-            momentum = sc["delta"]
-            msgs_factor = min(1.0, sc["n"] / max(1, SENTIMENT_MSGS_PER_SYM))
+            delta = tallies["delta"]
+            n_msgs = tallies["n"]
+            msgs_factor = min(1.0, n_msgs / max(1, SENTIMENT_MSGS_PER_SYM))
 
-            # Composite rank (simple, tunable)
-            coverage_term = math.log10(1 + coverage)  # 0.. ~
-            rank = 0.5 * coverage_term + 0.35 * sent + 0.15 * momentum
-            rank = round(rank, 4)
+            # Composite rank (simple): coverage + delta
+            coverage_term = math.log10(1 + coverage)  # 0..~
+            rank = round(0.55 * coverage_term + 0.45 * delta * msgs_factor, 4)
 
             # 2) Indicators via Alpaca (15m); if Alpaca enabled, REQUIRE bars or skip
             rsi = ma60 = ma240 = float("nan")
@@ -757,13 +737,13 @@ def run_sentiment(gc):
                 if not any(math.isnan(x) for x in (rsi, ma60, ma240)):
                     alpaca_full_indicators_ready += 1
 
-            # Decide leftmost flag
-            flag = pick_flag(sent, momentum, rsi, ma60, ma240)
+            # Decide leftmost flag — use delta for both sentiment value + momentum
+            flag = pick_flag(delta, delta, rsi, ma60, ma240)
 
             out.append([
-                flag, s, sc["mean"], sc["median"], sc["tmean"], sc["n"],
-                sc["pos"], sc["neg"], sc["neu"], sc["delta"],
-                coverage, round(msgs_factor, 4), rank,
+                flag, s,
+                tallies["bulls"], tallies["bears"], tallies["neu"], delta, n_msgs,
+                coverage, rank,
                 rsi, ma60, ma240,
                 datetime.now(timezone.utc).isoformat()
             ])
@@ -775,12 +755,12 @@ def run_sentiment(gc):
             logging.info(f"Processed {i}/{len(syms)}")
         _sleep_with_jitter(SENTIMENT_REQ_SLEEP_S)
 
-    # Note: new columns + flag at left; adjust column count accordingly
-    ws = ensure_worksheet(sh, SENTIMENT_WS, 5000, 18)
+    # Note: fewer columns + flag at left
+    ws = ensure_worksheet(sh, SENTIMENT_WS, 5000, 13)
     replace_sheet(ws, out, [
-        "flag","symbol","mean_comp","median_comp","trim_mean","n_msgs",
-        "pos_ratio","neg_ratio","neu_ratio","bull_bear_delta",
-        "source_hits","msgs_factor","rank",
+        "flag","symbol",
+        "bullish","bearish","neutral","bull_bear_delta","n_msgs",
+        "source_hits","rank",
         "RSI14_15m","MA60_15m","MA240_15m","scored_at_utc"
     ])
 
@@ -835,7 +815,7 @@ def main():
     run_scraper(gc)
     run_sentiment(gc)
     run_demo(gc)
-    print("Done: scrape + sentiment + indicators + flags + formatting")
+    print("Done: scrape + direct Stocktwits sentiment + indicators + flags + formatting (lean columns)")
 
 if __name__ == "__main__":
     main()
