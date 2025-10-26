@@ -28,7 +28,7 @@ NASDAQ_ENABLED            = os.getenv("NASDAQ_ENABLED", "0") not in {"0", "false
 STOCKTWITS_ENABLED        = os.getenv("STOCKTWITS_ENABLED", "1") not in {"0", "false", "False"}
 STOCKTWITS_SENTIMENT_EN   = os.getenv("STOCKTWITS_SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
 
-# Sentiment params
+# Sentiment params (collection only; NOT used for flags)
 SENTIMENT_ENABLED          = os.getenv("SENTIMENT_ENABLED", "1") not in {"0", "false", "False"}
 SENTIMENT_SYMBOL_LIMIT     = int(os.getenv("SENTIMENT_SYMBOL_LIMIT", "150"))
 SENTIMENT_MSGS_PER_SYM     = int(os.getenv("SENTIMENT_MSGS_PER_SYM", "30"))
@@ -272,7 +272,7 @@ def _get_yahoo_predefined(scr_id: str, count: int = 100) -> List[str]:
 def get_yahoo_most_active() -> List[str]:
     return _get_yahoo_predefined("most_actives")
 
-# ⭐ New sources:
+# ⭐ Extra sources:
 def get_yahoo_day_gainers() -> List[str]:
     return _get_yahoo_predefined("day_gainers")
 
@@ -443,7 +443,7 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
         except Exception as e:
             logging.info(f"{name}: skipped ({e})")
 
-    # Stocks only (trending/most active + NEW gainers/losers)
+    # Stocks only (trending/most active + gainers/losers)
     try_add("Yahoo Finance - Trending (US)", get_yahoo_trending_stocks)
     try_add("Yahoo Finance - Most Active", get_yahoo_most_active)
     try_add("Yahoo Finance - Day Gainers", get_yahoo_day_gainers)
@@ -454,7 +454,7 @@ def collect_sources() -> List[Tuple[str, List[str]]]:
         for name, syms in get_google_finance_symbols():
             sources.append((name, syms))
 
-    # Stocktwits sentiment lists (symbols only; per-message sentiment scored later)
+    # Stocktwits sentiment lists (symbols only; message-level sentiment tallied later)
     for name, syms in get_stocktwits_sentiment_sets():
         sources.append((name, syms))
 
@@ -500,7 +500,7 @@ def tally_stocktwits_sentiment(msgs: List[Dict]) -> Dict[str, float]:
     return {"bulls": bulls, "bears": bears, "neu": neu, "n": n, "delta": delta}
 
 # =========================
-# Alpaca indicators + flag rules (⭐ / 🔻 / ▲)
+# Alpaca indicators + TECH-ONLY flag rules (⭐ / 🔻 / ▲)
 # =========================
 ALPACA_API_KEY_ID    = os.getenv("ALPACA_API_KEY_ID", "")
 ALPACA_API_SECRET_KEY= os.getenv("ALPACA_API_SECRET_KEY", "")
@@ -508,10 +508,11 @@ ALPACA_DATA_BASE     = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.market
 ALPACA_FEED          = os.getenv("ALPACA_FEED", "iex")  # "iex" or "sip" (paid)
 ALPACA_LOOKBACK_DAYS = int(os.getenv("ALPACA_LOOKBACK_DAYS", "30"))
 
-SENT_POS_THRESH      = float(os.getenv("SENT_POS_THRESH", "0.05"))
-SENT_NEG_THRESH      = float(os.getenv("SENT_NEG_THRESH", "-0.05"))
-RSI_MOMO_MAX         = float(os.getenv("RSI_MOMO_MAX", "60"))
-MOMENTUM_GOOD_THRESH = float(os.getenv("MOMENTUM_GOOD_THRESH", "0.10"))
+# --- Tech-only thresholds for flags (no sentiment used) ---
+RSI_OVERSOLD   = float(os.getenv("RSI_OVERSOLD", "35"))   # ⭐ oversold threshold
+RSI_MID_LOW    = float(os.getenv("RSI_MID_LOW", "40"))    # ▲ mid-range lower bound
+RSI_MID_HIGH   = float(os.getenv("RSI_MID_HIGH", "60"))   # ▲ mid-range upper bound
+RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "70")) # 🔻 overbought threshold
 
 def _alpaca_enabled() -> bool:
     return bool(ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY)
@@ -581,27 +582,26 @@ def rsi14(values: List[float]) -> float:
     rs = gains / losses
     return round(100 - (100 / (1 + rs)), 2)
 
-def pick_flag(sent_value: float, delta: float, rsi: float, ma60: float, ma240: float) -> str:
+def pick_flag(rsi: float, ma60: float, ma240: float) -> str:
     """
-    Flags priority:
-      1) ⭐ if RSI<35 and MA60<MA240 (15m)
-      2) 🔻 if MA60>MA240 and sentiment <= SENT_NEG_THRESH
-      3) ▲  if MA60>MA240 and sentiment >= SENT_POS_THRESH and RSI<=RSI_MOMO_MAX and delta>=MOMENTUM_GOOD_THRESH
-      else ""
+    PURE INDICATOR FLAGS (no sentiment):
+      1) ⭐ Oversold in a downtrend  : RSI < RSI_OVERSOLD AND MA60 < MA240
+      2) ▲ Bullish trend w/ healthy RSI: MA60 > MA240 AND RSI in [RSI_MID_LOW, RSI_MID_HIGH]
+      3) 🔻 Weak/downtrend & overbought: MA60 < MA240 AND RSI > RSI_OVERBOUGHT
+      Otherwise: ""
     """
     if any(math.isnan(x) for x in (rsi, ma60, ma240)):
         return ""
-    if rsi < 35 and ma60 < ma240:
+    if rsi < RSI_OVERSOLD and ma60 < ma240:
         return "⭐"
-    if ma60 > ma240:
-        if sent_value <= SENT_NEG_THRESH:
-            return "🔻"
-        if sent_value >= SENT_POS_THRESH and rsi <= RSI_MOMO_MAX and delta >= MOMENTUM_GOOD_THRESH:
-            return "▲"
+    if ma60 > ma240 and (RSI_MID_LOW <= rsi <= RSI_MID_HIGH):
+        return "▲"
+    if ma60 < ma240 and rsi > RSI_OVERBOUGHT:
+        return "🔻"
     return ""
 
 # =========================
-# Formatting helper (uses GridRange) — updated for fewer columns
+# Formatting helper (uses GridRange) — lean columns
 # =========================
 def apply_sentiment_conditional_formats(ws):
     set_frozen(ws, rows=1)
@@ -706,7 +706,7 @@ def run_sentiment(gc):
             n_msgs = tallies["n"]
             msgs_factor = min(1.0, n_msgs / max(1, SENTIMENT_MSGS_PER_SYM))
 
-            # Composite rank (simple): coverage + delta
+            # Composite rank (simple): coverage + delta (kept as heuristic)
             coverage_term = math.log10(1 + coverage)  # 0..~
             rank = round(0.55 * coverage_term + 0.45 * delta * msgs_factor, 4)
 
@@ -737,8 +737,8 @@ def run_sentiment(gc):
                 if not any(math.isnan(x) for x in (rsi, ma60, ma240)):
                     alpaca_full_indicators_ready += 1
 
-            # Decide leftmost flag — use delta for both sentiment value + momentum
-            flag = pick_flag(delta, delta, rsi, ma60, ma240)
+            # 3) Decide leftmost flag — TECH ONLY (no sentiment influence)
+            flag = pick_flag(rsi, ma60, ma240)
 
             out.append([
                 flag, s,
@@ -815,7 +815,7 @@ def main():
     run_scraper(gc)
     run_sentiment(gc)
     run_demo(gc)
-    print("Done: scrape + direct Stocktwits sentiment + indicators + flags + formatting (lean columns)")
+    print("Done: scrape + direct Stocktwits sentiment + TECH-only flags + indicators + formatting")
 
 if __name__ == "__main__":
     main()
